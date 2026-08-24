@@ -2,9 +2,12 @@
 
 Draft for discussion. Version 0.2, 2026-08-24.
 
-Changes since 0.1: corrected against the current protocol. Version 1.5 was skipped, 1.6
-already replaced the concatenated header blob with a list, and 1.7 is documented, so the
-proposal targets 1.8 and the concatenation problem is smaller than 0.1 claimed.
+Changes since 0.1: corrected against the current protocol and against what is actually
+deployed. Version 1.5 was skipped, 1.6 replaced the concatenated header blob with a list,
+and 1.7 is documented, so the proposal targets 1.8. But a survey of public servers shows
+Fulcrum is the only implementation reaching 1.6, so the concatenated form is still what
+almost everything exchanges. All wire-format claims are now verified against live chain
+data rather than read from source.
 
 ## Problem
 
@@ -104,27 +107,35 @@ a clear connection failure than a wallet that quietly believes something false.
 Servers on chains with no v2 headers keep negotiating as they do now. Nothing changes for
 them.
 
-### 3. Header length: mostly already handled, and worth being explicit about
+### 3. Header length must be read, not assumed
 
-Protocol 1.6 changed `blockchain.block.headers()` from a concatenated hex string to a list:
+Protocol 1.6 changed `blockchain.block.headers()` from a concatenated hex string to a list,
+which would remove most of this problem on its own. Each header is then its own string, so
+its length is self-evident and nothing has to be sliced on a stride.
 
-```
-{ "count": 2, "headers": ["<hex>", "<hex>"], "max": 2016 }
-```
+Deployment tells a different story. Probing public servers on 2026-08-24:
 
-That removes most of the problem on its own. Each header is its own string, so its length is
-self-evident and no client has to walk a blob on an 80-byte stride. A 1.6 or 1.7 client
-already receives v2 headers intact.
+| server | software | `protocol_max` | `block.headers` at the negotiated version |
+|---|---|---|---|
+| fulcrum.sethforprivacy.com | Fulcrum 2.1.2 | 1.6 | list |
+| fulcrum.kilombino.com | Fulcrum 2.1.0 | 1.6 | list |
+| electrum.emzy.de | ElectrumX 1.18.0 | 1.4.3 | concatenated hex |
+| bitcoin.lu.ke | ElectrumX 1.18.0 | 1.4.3 | concatenated hex |
+| electrum.blockstream.info | electrs-esplora 0.4.1 | 1.4 | concatenated hex |
 
-Two things still need saying.
+Fulcrum is the only implementation of the four that reaches 1.6. ElectrumX caps at 1.4.3,
+and both electrs lines cap at 1.4. On the client side, Sparrow negotiates 1.4 in practice.
 
-A client below 1.6 gets the concatenated form and will slice it on an 80-byte stride. That
-is another reason for the version floor in point 2.
+So the concatenated form is what almost everything actually exchanges, and a client that
+wants to follow a v2 chain cannot wait for servers to reach 1.6 first.
 
-And a client of any version may still assume 80 bytes when it parses an individual header,
-for example when reading fields at fixed offsets or when validating length before use.
-1.8 should state that a header is 80 or 164 bytes and that the length is determined by bit
-31 of the version field, so parsing is by inspection rather than by assumption.
+That makes the self-describing marker do real work rather than being a curiosity. A client
+walks the blob: read four bytes, take 80 or 164 depending on bit 31, repeat, and check the
+walk consumed exactly `count` headers and did not run off the end. The same routine handles
+the 1.6 list form, where each element is simply already separated.
+
+1.8 should state that a header is 80 or 164 bytes, that the length is determined by bit 31
+of the version field, and that this holds in both the concatenated and list forms.
 
 Servers may want to lower `max` on a v2 chain. At 2016 headers the response roughly doubles.
 
@@ -192,18 +203,35 @@ chain is more useful than a client that does neither, and it is a small change.
 
 ## Verified against the live chain
 
-The claims above are not theoretical. Checked on 2026-08-24 against a public explorer's API
-for BLAKE2b testnet4, reading raw headers either side of the activation height:
+The claims above are not read from source alone. Decoded on 2026-08-24 from a real v2
+header on BLAKE2b testnet4, block 169000, using the offsets in the table below. Eleven
+checks, all passing:
 
 ```
-height 149536:  160 hex chars ( 80 bytes)  version field 00c07a2d  bit 31 clear  v1
-height 149537:  328 hex chars (164 bytes)  version field 000000a0  bit 31 set    v2
-height 169000:  328 hex chars (164 bytes)  version field 000000a0  bit 31 set    v2
+header is 164 bytes                                    yes
+bit 31 of version set                                  version = 0xa0000000
+m_height at offset 128 equals the block height         169000
+m_txcount at offset 108 equals the tx count            1
+hashPrevBlock at offset 4 matches the explorer         yes
+hashMerkleRoot at offset 36 matches the explorer       yes
+merkle root is still SHA256d over the tx tree          recomputed from txids, matches
+block hash is NOT SHA256d over the 164 bytes           sha256d gives 533a54b9fb34669d...
+nor SHA256d over the first 80 bytes                    no match either
+genesis matches ordinary testnet4                      00000000da84f2ba...bf043
+block 149536 is still v1                               80 bytes
 ```
 
-149537 is the activation height compiled into `CTestNet4Params` in
-`v29.4.1.knots20260508rc2`. The transition lands exactly there, the marker behaves as
-documented, and a parser reading four bytes gets the right length on both sides of it.
+`m_height` and `m_txcount` are the useful ones: both are values the explorer reports
+independently, so agreeing with them at the claimed offsets is a real check on the layout
+rather than a restatement of it.
+
+The last two matter for specific points above. Genesis being shared with ordinary testnet4
+is why `genesis_hash` cannot identify this chain. And the block hash matching neither
+SHA256d over 164 bytes nor over the first 80 is the concrete demonstration that block
+identity, not just header length, has changed.
+
+The script is `spikes/electrum-probe/verify_header_v2.py` in this repo. It is read-only
+against a public explorer API and takes a height as its argument.
 
 ## Reference material
 
