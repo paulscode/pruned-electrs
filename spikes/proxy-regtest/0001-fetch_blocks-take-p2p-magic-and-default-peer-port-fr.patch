@@ -1,0 +1,215 @@
+From 56daf334a7ab5990a1c50a2345b9e4b710eac4ef Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Sat, 22 Aug 2026 13:35:56 -0500
+Subject: [PATCH 1/3] fetch_blocks: take p2p magic and default peer port from
+ config
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The block fetcher hardcoded Network::Bitcoin.magic() in the version, verack,
+getdata and pong it exchanges with peers, and assumed :8333 for any peer
+address getpeerinfo reported without a port. A peer on another network drops
+the connection rather than answering, so the pruned-block fetch path — the
+whole reason the proxy exists — could only ever work on mainnet.
+
+Adds a 'network' config param (bitcoin|testnet|signet|regtest, default
+bitcoin, so existing deployments are unaffected) and carries the resolved
+magic and default port on State.
+
+Motivation: without this there is no way to exercise pruned-block retrieval on
+regtest, which makes the behaviour untestable outside a live mainnet node.
+---
+ config_spec.toml    |  6 +++++
+ src/create_state.rs | 16 ++++++++++++
+ src/fetch_blocks.rs | 60 ++++++++++++++++++++++-----------------------
+ src/state.rs        |  7 ++++++
+ 4 files changed, 59 insertions(+), 30 deletions(-)
+
+diff --git a/config_spec.toml b/config_spec.toml
+index d88ba4c..1a13eb5 100644
+--- a/config_spec.toml
++++ b/config_spec.toml
+@@ -78,6 +78,12 @@ default = "Default::default()"
+ argument = false
+ doc = "Map of user names to user configs. Each user must specify `password` field and an array of allowed calls named `allowed_calls`"
+ 
++[[param]]
++name = "network"
++type = "String"
++default = "\"bitcoin\".to_owned()"
++doc = "Which Bitcoin network the peers speak: bitcoin, testnet, signet or regtest. Selects the p2p magic bytes and the default peer port."
++
+ [[param]]
+ name = "peer_timeout"
+ type = "u64"
+diff --git a/src/create_state.rs b/src/create_state.rs
+index 447c90c..70631d7 100644
+--- a/src/create_state.rs
++++ b/src/create_state.rs
+@@ -54,6 +54,20 @@ pub fn create_state() -> Result<(State, SocketAddr), Error> {
+     })?;
+     let rpc_client = RpcClient::new(auth, bitcoin_uri, &logger);
+ 
++    let network_name = config.network.clone();
++    let network: bitcoin::network::constants::Network = network_name.parse().map_err(|_| {
++        let msg = "network must be one of: bitcoin, testnet, signet, regtest";
++        slog::error!(logger, "{}", msg; "network" => &network_name);
++        anyhow::anyhow!("{} (got {:?})", msg, network_name)
++    })?;
++    let default_peer_port = match network {
++        bitcoin::network::constants::Network::Bitcoin => 8333,
++        bitcoin::network::constants::Network::Testnet => 18333,
++        bitcoin::network::constants::Network::Signet => 38333,
++        bitcoin::network::constants::Network::Regtest => 18444,
++        _ => 8333,
++    };
++
+     let tor_only = config.tor_only;
+     let tor = config.tor_proxy.map(|proxy| TorState {
+         proxy,
+@@ -137,6 +151,8 @@ pub fn create_state() -> Result<(State, SocketAddr), Error> {
+             peers: RwLock::new(Arc::new(Peers::new())),
+             max_peer_age: Duration::from_secs(config.max_peer_age),
+             max_peer_concurrency: config.max_peer_concurrency,
++            magic: network.magic(),
++            default_peer_port,
+         },
+         bind_addr,
+     ))
+diff --git a/src/fetch_blocks.rs b/src/fetch_blocks.rs
+index e799aef..8e1bf61 100644
+--- a/src/fetch_blocks.rs
++++ b/src/fetch_blocks.rs
+@@ -10,7 +10,7 @@ use bitcoin::{
+     consensus::{Decodable, Encodable},
+     hash_types::BlockHash,
+     network::{
+-        constants::{Network::Bitcoin, ServiceFlags},
++        constants::ServiceFlags,
+         message::{NetworkMessage, RawNetworkMessage},
+         message_blockdata::Inventory,
+         message_network::VersionMessage,
+@@ -27,31 +27,30 @@ use crate::client::{
+ use crate::rpc_methods::{GetBlock, GetBlockParams, GetPeerInfo, PeerAddressError};
+ use crate::state::{State, TorState};
+ 
+-type VersionMessageProducer = Box<dyn Fn() -> RawNetworkMessage + Send + Sync>;
+-
+-lazy_static::lazy_static! {
+-    static ref VER_ACK: RawNetworkMessage = RawNetworkMessage {
+-        magic: Bitcoin.magic(),
++fn ver_ack(magic: u32) -> RawNetworkMessage {
++    RawNetworkMessage {
++        magic,
+         payload: NetworkMessage::Verack,
+-    };
+-    static ref VERSION_MESSAGE: VersionMessageProducer = Box::new(|| {
+-        use std::time::SystemTime;
+-        RawNetworkMessage {
+-            magic: Bitcoin.magic(),
+-            payload: NetworkMessage::Version(VersionMessage::new(
+-                ServiceFlags::NONE,
+-                SystemTime::now()
+-                    .duration_since(SystemTime::UNIX_EPOCH)
+-                    .unwrap()
+-                    .as_secs() as i64,
+-                bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), ServiceFlags::NONE),
+-                bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), ServiceFlags::NONE),
+-                0,
+-                format!("BTC RPC Proxy v{}", env!("CARGO_PKG_VERSION")),
+-                0,
+-            )),
+-        }
+-    });
++    }
++}
++
++fn version_message(magic: u32) -> RawNetworkMessage {
++    use std::time::SystemTime;
++    RawNetworkMessage {
++        magic,
++        payload: NetworkMessage::Version(VersionMessage::new(
++            ServiceFlags::NONE,
++            SystemTime::now()
++                .duration_since(SystemTime::UNIX_EPOCH)
++                .unwrap()
++                .as_secs() as i64,
++            bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), ServiceFlags::NONE),
++            bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), ServiceFlags::NONE),
++            0,
++            format!("BTC RPC Proxy v{}", env!("CARGO_PKG_VERSION")),
++            0,
++        )),
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -154,7 +153,7 @@ impl Write for BitcoinPeerConnection {
+ impl BitcoinPeerConnection {
+     pub async fn connect(state: Arc<State>, mut addr: Arc<String>) -> Result<Self, Error> {
+         if !addr.contains(":") {
+-            addr = Arc::new(format!("{}:8333", &*addr));
++            addr = Arc::new(format!("{}:{}", &*addr, state.default_peer_port));
+         }
+         tokio::time::timeout(
+             state.peer_timeout,
+@@ -176,13 +175,13 @@ impl BitcoinPeerConnection {
+                         _ => BitcoinPeerConnection::Direct(TcpStream::connect(&*addr)?),
+                     }
+                 };
+-                VERSION_MESSAGE().consensus_encode(&mut stream)?;
++                version_message(state.magic).consensus_encode(&mut stream)?;
+                 stream.flush()?;
+                 let _ =
+                     bitcoin::network::message::RawNetworkMessage::consensus_decode(&mut stream)?; // version
+                 let _ =
+                     bitcoin::network::message::RawNetworkMessage::consensus_decode(&mut stream)?; // verack
+-                VER_ACK.consensus_encode(&mut stream)?;
++                ver_ack(state.magic).consensus_encode(&mut stream)?;
+                 stream.flush()?;
+ 
+                 Ok(stream)
+@@ -285,10 +284,11 @@ async fn fetch_block_from_peer<'a>(
+     hash: BlockHash,
+     mut conn: RecyclableConnection,
+ ) -> Result<(Block, RecyclableConnection), Error> {
++    let magic = state.magic;
+     tokio::time::timeout(state.peer_timeout, async move {
+         conn = tokio::task::spawn_blocking(move || {
+             RawNetworkMessage {
+-                magic: Bitcoin.magic(),
++                magic,
+                 payload: NetworkMessage::GetData(vec![Inventory::Block(hash)]),
+             }
+             .consensus_encode(&mut *conn)
+@@ -328,7 +328,7 @@ async fn fetch_block_from_peer<'a>(
+                 NetworkMessage::Ping(p) => {
+                     conn = tokio::task::spawn_blocking(move || {
+                         RawNetworkMessage {
+-                            magic: Bitcoin.magic(),
++                            magic,
+                             payload: NetworkMessage::Pong(p),
+                         }
+                         .consensus_encode(&mut *conn)
+diff --git a/src/state.rs b/src/state.rs
+index 052c505..88a339b 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -27,6 +27,13 @@ pub struct State {
+     pub peers: RwLock<Arc<Peers>>,
+     pub max_peer_age: Duration,
+     pub max_peer_concurrency: Option<usize>,
++    /// p2p magic bytes for the network bitcoind is on. Every message the block
++    /// fetcher exchanges with a peer carries it, and a peer on another network
++    /// drops the connection rather than answering, so this has to track
++    /// bitcoind's actual chain rather than being assumed to be mainnet.
++    pub magic: u32,
++    /// Port to assume when `getpeerinfo` reports a peer address without one.
++    pub default_peer_port: u16,
+ }
+ impl State {
+     pub fn leak(self) -> &'static Self {
+-- 
+2.43.0
+

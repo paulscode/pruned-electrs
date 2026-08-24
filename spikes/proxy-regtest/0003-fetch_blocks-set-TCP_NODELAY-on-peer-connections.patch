@@ -1,0 +1,77 @@
+From 71e9d79995796872e584af974c8e27904e9d0495 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Sat, 22 Aug 2026 19:24:20 -0500
+Subject: [PATCH 3/3] fetch_blocks: set TCP_NODELAY on peer connections
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+consensus_encode writes a p2p message to the socket in several small pieces.
+With Nagle enabled the kernel holds each piece after the first until the peer
+ACKs, and the peer's delayed-ACK timer defers that by ~40ms. Every write in the
+encode path can stall, so the penalty compounds with message size rather than
+costing a single flat delay.
+
+Measured over loopback (regtest, ~250-byte blocks), 100 sequential fetches:
+
+  before   23.7 blocks/s   median 42.03ms   p95 43.08ms
+  after  1692.0 blocks/s   median  0.58ms   p95  0.68ms
+
+Measured against real mainnet peers over clearnet, 5 fetches per height:
+
+  height    size     with NODELAY    without
+  200000    0.25M       152.6ms       342.8ms
+  400000    0.95M       159.5ms       482.6ms
+  600000    0.87M       158.4ms       499.1ms
+  700000    1.28M       164.6ms       589.5ms
+  800000    1.63M       166.3ms       726.0ms
+  900000    1.92M       172.7ms       931.7ms
+
+With the option set, per-block latency is flat in block size — the fetch is
+RTT-bound, and throughput rises from 1.6 to 11.1 MB/s as blocks grow. Without
+it, latency tracks size and throughput is pinned near 2 MB/s whatever the block.
+So this is 3.4x at the median and 5.4x on present-day blocks, widening as blocks
+get bigger, not the fixed saving the loopback figure alone suggests.
+
+For a consumer doing sequential historical fetches — a pruning-aware electrs
+building an index, say — that is 40 hours against 136 hours for a full chain.
+---
+ src/fetch_blocks.rs | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/fetch_blocks.rs b/src/fetch_blocks.rs
+index d28154f..505702a 100644
+--- a/src/fetch_blocks.rs
++++ b/src/fetch_blocks.rs
+@@ -151,6 +151,18 @@ impl Write for BitcoinPeerConnection {
+     }
+ }
+ impl BitcoinPeerConnection {
++    /// Disable Nagle. `consensus_encode` writes a message to the socket in
++    /// several small pieces, and with Nagle on the kernel holds everything
++    /// after the first piece until the peer ACKs — which the peer's own
++    /// delayed-ACK timer defers by ~40ms. That turns every block fetch into a
++    /// fixed ~40ms stall regardless of how close the peer is.
++    fn set_nodelay(&self) -> std::io::Result<()> {
++        match self {
++            BitcoinPeerConnection::Direct(s) => s.set_nodelay(true),
++            BitcoinPeerConnection::Proxied(s) => s.get_ref().set_nodelay(true),
++        }
++    }
++
+     pub async fn connect(state: Arc<State>, mut addr: Arc<String>) -> Result<Self, Error> {
+         if !addr.contains(":") {
+             addr = Arc::new(format!("{}:{}", &*addr, state.default_peer_port));
+@@ -175,6 +187,9 @@ impl BitcoinPeerConnection {
+                         _ => BitcoinPeerConnection::Direct(TcpStream::connect(&*addr)?),
+                     }
+                 };
++                if let Err(e) = stream.set_nodelay() {
++                    warn!(state.logger, "failed to set TCP_NODELAY"; "error" => %e);
++                }
+                 version_message(state.magic).consensus_encode(&mut stream)?;
+                 stream.flush()?;
+                 let _ =
+-- 
+2.43.0
+

@@ -1,0 +1,20 @@
+Diagnostic spike ONLY — not a proposed change.
+
+Removes the startup guard at src/daemon.rs so we can observe what upstream
+electrs does next against a pruned node. The question this answers: is the
+guard the only thing standing between electrs and a pruned backend, or is it
+covering for a deeper problem in the block-fetch path?
+
+Apply with `patch -p1`, build, run, then `git checkout src/daemon.rs`.
+
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -135,7 +135,7 @@
+         }
+         let info = rpc.get_blockchain_info()?;
+         if info.pruned {
+-            bail!("electrs requires non-pruned bitcoind node");
++            warn!("SPIKE: pruned node accepted; pruneheight={:?}", info.prune_height);
+         }
+
+         let p2p = Mutex::new(Connection::connect(

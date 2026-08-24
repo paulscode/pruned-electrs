@@ -1,0 +1,18 @@
+vendor/
+spikes/**/data/
+spikes/**/electrs-db/
+spikes/**/*.log
+spikes/**/*.pid
+spikes/**/proxy.toml
+spikes/**/electrs.toml
+spikes/**/nodeA/
+spikes/**/nodeB/
+spikes/**/electrs-slow.toml
+spikes/mainnet-fetch/*.log
+packaging/*/node_modules/
+packaging/*/javascript/
+
+# The StartOS packaging is its own repository, per the two-repo recommendation
+# in ARCHITECTURE.md — keeping the electrs deltas a patch set over a pinned
+# upstream submodule is what keeps rebasing cheap.
+packaging/

@@ -1,0 +1,50 @@
+From a14da22a866a91649602174349d288c1b932776f Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Sat, 22 Aug 2026 13:36:14 -0500
+Subject: [PATCH 2/3] fetch_blocks: request MSG_WITNESS_BLOCK, not MSG_BLOCK
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A peer served MSG_BLOCK returns the witness-stripped serialization. The proxy
+then re-encoded that and handed it back as the answer to getblock, so every
+block it fetched from a peer was missing the segwit marker/flag and every
+witness stack — silently, because neither validation catches it: the merkle
+root commits to txids (unchanged by stripping) and check_witness_commitment()
+short-circuits to true once no transaction carries a witness.
+
+Verified on regtest against an archival peer: before, a fetched block was 216
+bytes against the archival node's 252; after, byte-identical.
+
+Consumers see a block whose transactions have correct txids but the wrong
+serialization, which breaks anything returning raw transactions to a wallet.
+electrs already asks its own p2p peer for WitnessBlock, so a pruning-aware
+electrs routing some heights through the proxy would otherwise get a different
+serialization above and below the prune height.
+---
+ src/fetch_blocks.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/fetch_blocks.rs b/src/fetch_blocks.rs
+index 8e1bf61..d28154f 100644
+--- a/src/fetch_blocks.rs
++++ b/src/fetch_blocks.rs
+@@ -289,7 +289,14 @@ async fn fetch_block_from_peer<'a>(
+         conn = tokio::task::spawn_blocking(move || {
+             RawNetworkMessage {
+                 magic,
+-                payload: NetworkMessage::GetData(vec![Inventory::Block(hash)]),
++                // WitnessBlock, not Block: MSG_BLOCK makes a segwit-aware peer
++                // serve the *stripped* serialization, so the block that comes
++                // back is missing the marker/flag and every witness stack. It
++                // still passes both checks below — the merkle root commits to
++                // txids, which stripping does not change, and
++                // check_witness_commitment() returns true vacuously once no
++                // transaction carries a witness — so the loss is silent.
++                payload: NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+             }
+             .consensus_encode(&mut *conn)
+             .map_err(Error::from)
+-- 
+2.43.0
+
