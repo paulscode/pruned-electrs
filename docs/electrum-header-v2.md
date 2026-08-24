@@ -1,11 +1,19 @@
 # Electrum protocol: variable-length block headers
 
-Draft for discussion. Version 0.1, 2026-08-24.
+Draft for discussion. Version 0.2, 2026-08-24.
+
+Changes since 0.1: corrected against the current protocol. Version 1.5 was skipped, 1.6
+already replaced the concatenated header blob with a list, and 1.7 is documented, so the
+proposal targets 1.8 and the concatenation problem is smaller than 0.1 claimed.
 
 ## Problem
 
 The Electrum protocol assumes a block header is 80 bytes and that its hash is SHA256d over
 those bytes. Both assumptions are baked into clients rather than into the wire format.
+
+Protocol versions referenced here: 1.5 was skipped, 1.6 changed
+`blockchain.block.headers()` to return a list rather than a concatenated hex string, and
+1.7 is the current documented version. So this proposal targets **1.8**.
 
 Bitcoin Knots PR #359 introduces a second header format. A v2 header is 164 bytes and its
 hash is a staged BLAKE2b computation. The change is live on testnet4 today, activated at
@@ -74,43 +82,51 @@ discovering it by hitting a 164-byte header is an unpleasant way to find out.
 
 ## Proposed changes
 
-### 1. Protocol version 1.5
+### 1. Protocol version 1.8
 
-Bump the negotiated version. A client advertising 1.5 states that it parses headers by
-length prefix rather than by fixed stride.
+Bump the negotiated version. A client advertising 1.8 states that it does not assume a
+header is 80 bytes and knows which hash function identifies a block on this chain.
 
-Negotiation is unchanged: `server.version(client_name, protocol_version)` returns the
-agreed version, using the existing min/max rules.
+Negotiation is unchanged, and 1.6 already mandates that `server.version()` is the first
+message sent, which makes the check cheap: a server knows the client's version before it
+has to serve anything.
 
-### 2. Servers on a chain with v2 headers must not negotiate below 1.5
+### 2. Servers on a chain with v2 headers must not negotiate below 1.8
 
-This is the safety-critical part. If a 1.4 client connects to a server on such a chain and
-the server accepts the negotiation, the client silently mis-parses every header past
-activation. It does not fail loudly. It computes wrong hashes, fails to link the chain, and
+This is the safety-critical part. A client below 1.8 does not fail loudly on this chain. It
+computes the wrong hash for every header past activation, fails to link the chain, and
 depending on the client may present that as a sync problem rather than an incompatibility.
 
-A server that knows its chain uses v2 headers should refuse to negotiate below 1.5, closing
+A server that knows its chain uses v2 headers should refuse to negotiate below 1.8, closing
 the connection as the existing rules already require when no common version exists. Better
 a clear connection failure than a wallet that quietly believes something false.
 
-Servers on chains with no v2 headers keep negotiating 1.4 as they do now. Nothing changes
-for them.
+Servers on chains with no v2 headers keep negotiating as they do now. Nothing changes for
+them.
 
-### 3. `blockchain.block.headers` is parsed by walking, not by stride
+### 3. Header length: mostly already handled, and worth being explicit about
 
-The result format does not change:
+Protocol 1.6 changed `blockchain.block.headers()` from a concatenated hex string to a list:
 
 ```
-{ "count": 2, "hex": "<concatenated headers>", "max": 2016 }
+{ "count": 2, "headers": ["<hex>", "<hex>"], "max": 2016 }
 ```
 
-`hex` remains the concatenation of the raw headers in order. What changes is how a client
-splits it: read four bytes, derive the length, take that many bytes, repeat. `count` still
-says how many headers are present, so a client can check its walk consumed exactly that
-many and did not run off the end.
+That removes most of the problem on its own. Each header is its own string, so its length is
+self-evident and no client has to walk a blob on an 80-byte stride. A 1.6 or 1.7 client
+already receives v2 headers intact.
 
-Servers may want to lower `max` on a v2 chain. At 2016 headers the response goes from about
-323 kB of hex to about 661 kB.
+Two things still need saying.
+
+A client below 1.6 gets the concatenated form and will slice it on an 80-byte stride. That
+is another reason for the version floor in point 2.
+
+And a client of any version may still assume 80 bytes when it parses an individual header,
+for example when reading fields at fixed offsets or when validating length before use.
+1.8 should state that a header is 80 or 164 bytes and that the length is determined by bit
+31 of the version field, so parsing is by inspection rather than by assumption.
+
+Servers may want to lower `max` on a v2 chain. At 2016 headers the response roughly doubles.
 
 ### 4. Checkpoint proofs use the chain's own block hash
 
@@ -127,6 +143,17 @@ This needs stating explicitly because "the header hash" is ambiguous once there 
 hash functions in one chain.
 
 ### 5. Chain identity needs a field, and `genesis_hash` will not do
+
+Note the timing here. Protocol 1.7 **removed** `hash_function` from `server.features()`,
+which was the one field that spoke to how a chain hashes. It reported `"sha256"` and was
+presumably dropped as a constant nobody varied. A chain that varies it arrived shortly
+afterwards.
+
+I am not proposing to restore it. `hash_function` described the scripthash function rather
+than the header hash, so restoring it would answer a different question. But it is worth
+noting that the field which looks like it should carry this does not exist any more, and
+that whatever replaces it should be about the header.
+
 
 `server.features` reports `genesis_hash`, which clients use to confirm they are talking to
 a server on the chain they expect.
@@ -162,6 +189,21 @@ test vectors to get right.
 
 A client that does the first and clearly says it is not verifying proof of work on this
 chain is more useful than a client that does neither, and it is a small change.
+
+## Verified against the live chain
+
+The claims above are not theoretical. Checked on 2026-08-24 against a public explorer's API
+for BLAKE2b testnet4, reading raw headers either side of the activation height:
+
+```
+height 149536:  160 hex chars ( 80 bytes)  version field 00c07a2d  bit 31 clear  v1
+height 149537:  328 hex chars (164 bytes)  version field 000000a0  bit 31 set    v2
+height 169000:  328 hex chars (164 bytes)  version field 000000a0  bit 31 set    v2
+```
+
+149537 is the activation height compiled into `CTestNet4Params` in
+`v29.4.1.knots20260508rc2`. The transition lands exactly there, the marker behaves as
+documented, and a parser reading four bytes gets the right length on both sides of it.
 
 ## Reference material
 
@@ -203,9 +245,9 @@ Header layout is in `src/primitives/block.h`, and `GetHash()` is in
 
 ## Open questions
 
-1. Is 1.5 the right version number, or should this be negotiated some other way? A protocol
-   bump is heavier than a capability flag, but it is the mechanism that already exists and
-   the one clients already handle.
+1. Is a protocol bump the right mechanism, or should this be a capability flag? A bump is
+   heavier, but it is what already exists and what clients already handle, and 1.6 made
+   `server.version()` the first message so the answer is known before anything is served.
 2. For chain identity, fork point or opaque identifier?
 3. Should `max` be reduced on a v2 chain, or left to server operators?
 4. Does anything else in the protocol assume 80 bytes? I have looked at the header-carrying
