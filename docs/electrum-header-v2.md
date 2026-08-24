@@ -52,6 +52,26 @@ v1 and v2 headers is unambiguously parseable by walking it. A client that implem
 walk works on any chain, before and after any activation, without being told when the
 activation was.
 
+## A related gap, one layer down
+
+An Electrum server gets its data from the node over RPC, and there the format is not
+self-describing.
+
+`blockheaderToJSON()` clears bit 31 before reporting, so verbose `getblockheader` returns
+identical `version` and `versionHex` for a v1 and a v2 header, and none of the ten v2
+fields appear. A server that consumes the JSON cannot tell which format it is about to
+receive; the first thing it sees is a raw header of unexpected length. This was
+demonstrated on regtest by Kilombino on 2026-08-19 in the PR #359 thread.
+
+Knots PR #363 (AcesHigh70, open as of 2026-08-24) adds the v2 fields to
+`blockheaderToJSON` and emits `header_version` for every header, zero for v1. That closes
+the RPC-side gap.
+
+The two are independent. A server can already do everything in this document by parsing
+raw header hex, which is self-describing, and does not need to wait for #363. But
+implementers should know the JSON path cannot currently detect the change, because
+discovering it by hitting a 164-byte header is an unpleasant way to find out.
+
 ## Proposed changes
 
 ### 1. Protocol version 1.5
@@ -196,3 +216,8 @@ Header layout is in `src/primitives/block.h`, and `GetHash()` is in
 Nothing here is implemented yet. I am working on the indexer side in electrs and will
 report what the parsing work actually costs once it is done. If someone is already doing
 this in Fulcrum or ElectrumX, I would rather join that than duplicate it.
+
+There is precedent for specifying a layer that sits outside the node. luke-jr has said a
+BIP is to be written for the `getblocktemplate` BLAKE2b extensions, which is the same shape
+of problem in the mining direction: parameters the node does not determine, carried over a
+protocol the node does not own. This document is the equivalent for the wallet direction.
