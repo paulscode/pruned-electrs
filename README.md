@@ -12,6 +12,9 @@ hides a silent, permanent hang. This project routes blocks bitcoind no longer ho
 
 ## Documents
 
+- **[docs/electrum-header-v2.md](docs/electrum-header-v2.md)** — draft proposal for
+  carrying variable-length (BLAKE2b header v2) block headers over the Electrum protocol.
+  Open for comment.
 - **[DISCOVERY.md](DISCOVERY.md)** — pinned versions, how electrs actually fetches blocks and
   transactions, the Electrum method dependency table, proxy capabilities and defects, StartOS
   packaging behaviour, measurements.
