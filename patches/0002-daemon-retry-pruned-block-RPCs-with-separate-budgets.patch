@@ -1,4 +1,4 @@
-From ec2a69947cc0fdd3799e33e21429c45a1b8c9c68 Mon Sep 17 00:00:00 2001
+From d9f28723697593c5a8e526a37b748f4b18abedec Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 24 Aug 2026 07:53:04 -0500
 Subject: [PATCH 2/2] daemon: retry pruned-block RPCs, with separate budgets
