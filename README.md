@@ -67,8 +67,9 @@ Full numbers in [spikes/mainnet-fetch/RESULTS.md](spikes/mainnet-fetch/RESULTS.m
 | [spikes/proxy-regtest/0002](spikes/proxy-regtest/) | ″ | request `MSG_WITNESS_BLOCK` — fetched blocks were witness-stripped |
 | [spikes/proxy-regtest/0003](spikes/proxy-regtest/) | ″ | set `TCP_NODELAY` — removes a ~40 ms stall per fetch (71× on loopback) |
 
-Proxy patches 0002 and 0003 are live defects on every pruned StartOS node and should go upstream to
-Start9 independently of this project.
+Proxy patches 0002 and 0003 are live defects on every pruned StartOS node, independent of this
+project. All three are submitted upstream as
+[Start9Labs/btc-rpc-proxy#29](https://github.com/Start9Labs/btc-rpc-proxy/pull/29).
 
 ## Layout
 
