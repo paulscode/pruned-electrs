@@ -1,7 +1,7 @@
-From d9f28723697593c5a8e526a37b748f4b18abedec Mon Sep 17 00:00:00 2001
+From b7cb051c8ae12ad39cae3fe90c58fe83be0784ee Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 24 Aug 2026 07:53:04 -0500
-Subject: [PATCH 2/2] daemon: retry pruned-block RPCs, with separate budgets
+Subject: [PATCH 2/3] daemon: retry pruned-block RPCs, with separate budgets
  per caller
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -32,12 +32,12 @@ retries, and completes the index once the peer returns *without being
 restarted*. Gap repair, reorg, interrupted-resume and proxy-outage scenarios
 all still pass, as do the Electrum query checks at pruned heights.
 ---
- src/daemon.rs | 139 ++++++++++++++++++++++++++++++++++++++++++++++----
+ src/daemon.rs | 137 ++++++++++++++++++++++++++++++++++++++++++++++----
  src/index.rs  |   2 +-
- 2 files changed, 129 insertions(+), 12 deletions(-)
+ 2 files changed, 127 insertions(+), 12 deletions(-)
 
 diff --git a/src/daemon.rs b/src/daemon.rs
-index c931346..280cdaa 100644
+index f142d4b..192c0e2 100644
 --- a/src/daemon.rs
 +++ b/src/daemon.rs
 @@ -12,6 +12,7 @@ use serde_json::{json, value::RawValue, Value};
@@ -81,7 +81,7 @@ index c931346..280cdaa 100644
  impl Daemon {
      pub(crate) fn connect(
          config: &Config,
-@@ -165,7 +190,73 @@ impl Daemon {
+@@ -165,7 +190,70 @@ impl Daemon {
              metrics,
              config.magic,
          )?);
@@ -144,10 +144,7 @@ index c931346..280cdaa 100644
 +                        if now >= until {
 +                            break;
 +                        }
-+                        std::thread::sleep(std::cmp::min(
-+                            Duration::from_millis(250),
-+                            until - now,
-+                        ));
++                        std::thread::sleep(std::cmp::min(Duration::from_millis(250), until - now));
 +                    }
 +                    delay = std::cmp::min(delay * 2, RPC_RETRY_MAX_DELAY);
 +                }
@@ -156,7 +153,7 @@ index c931346..280cdaa 100644
      }
  
      pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {
-@@ -313,7 +404,27 @@ impl Daemon {
+@@ -313,7 +401,27 @@ impl Daemon {
          self.p2p.lock().get_new_headers(chain)
      }
  
@@ -185,20 +182,21 @@ index c931346..280cdaa 100644
      where
          B: IntoIterator<Item = BlockHash>,
          F: FnMut(BlockHash, SerBlock),
-@@ -337,8 +448,10 @@ impl Daemon {
+@@ -337,8 +445,11 @@ impl Daemon {
          if blockhashes.is_empty() {
              return Ok(());
          }
 -        let prune_height = self.prune_height()?;
 -        let heights = self.block_heights(&blockhashes)?;
-+        let prune_height = self.retry_rpc("reading prune height", budget, || self.prune_height())?;
++        let prune_height =
++            self.retry_rpc("reading prune height", budget, || self.prune_height())?;
 +        let heights = self.retry_rpc("resolving block heights", budget, || {
 +            self.block_heights(&blockhashes)
 +        })?;
  
          // Walk the batch as maximal runs of same-availability blocks rather
          // than partitioning it. Heights arrive in ascending order in the common
-@@ -356,13 +469,17 @@ impl Daemon {
+@@ -356,13 +467,17 @@ impl Daemon {
                  self.p2p.lock().for_blocks(run.iter().copied(), &mut func)?;
              } else {
                  for &hash in run {
