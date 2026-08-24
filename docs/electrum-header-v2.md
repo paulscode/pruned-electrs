@@ -176,24 +176,13 @@ above it, in one tree. The pairing function above the leaves does not change.
 
 ### 5. Chain identity needs a field, and `genesis_hash` will not do
 
-Note the timing here. Protocol 1.7 **removed** `hash_function` from `server.features()`,
-which was the one field that spoke to how a chain hashes. It reported `"sha256"` and was
-presumably dropped as a constant nobody varied. A chain that varies it arrived shortly
-afterwards.
-
-I am not proposing to restore it. `hash_function` described the scripthash function rather
-than the header hash, so restoring it would answer a different question. But it is worth
-noting that the field which looks like it should carry this does not exist any more, and
-that whatever replaces it should be about the header.
-
-
 `server.features` reports `genesis_hash`, which clients use to confirm they are talking to
 a server on the chain they expect.
 
 That does not work here. The BLAKE2b chain on testnet4 shares its genesis block with
-ordinary testnet4. Two servers can report identical `genesis_hash` and serve chains that
-diverge at height 149537. A wallet has no way to tell them apart from `server.features`
-alone.
+ordinary testnet4, confirmed by reading block 0 from both. Two servers can report identical
+`genesis_hash` and serve chains that diverge at height 149537. A wallet has no way to tell
+them apart from `server.features` alone.
 
 The same will be true of any future proof-of-work fork that keeps its history.
 
@@ -206,6 +195,13 @@ Some field is needed. Two options, and I do not have a strong preference:
 
 I lean towards the fork point because it needs no coordination and a client can verify it
 against what the server serves.
+
+One note on timing. Protocol 1.7 **removed** `hash_function` from `server.features()`. It
+reported `"sha256"` and was presumably dropped as a constant nobody varied. A chain that
+varies it arrived shortly afterwards. I am not proposing to restore it, because
+`hash_function` described the scripthash function rather than the header hash and would
+answer a different question. But the field that looks like it should carry this no longer
+exists, and whatever replaces it should be about the header.
 
 ## Client adoption can be staged
 
@@ -288,14 +284,9 @@ the wild here.
 
 ## Reference material
 
-Knots ships test vectors at `src/test/data/block_header_v2.json`: five headers covering all
-four ASIC profiles. Each vector carries every intermediate stage of the hash
-(`xor_key_hash`, `h1`, `h2`, `blake2b_1`, `blake2b_2`, `mask`, `asic_input`, `serialized`,
-`block_hash`), so an implementation can be checked stage by stage rather than pass or fail
-at the end. That turns the hardest part of the work into a lookup.
-
-Header layout is in `src/primitives/block.h`, and `GetHash()` is in
-`src/primitives/block.cpp`.
+Header layout is in `src/primitives/block.h`. `GetHash()` is in
+`src/primitives/block.cpp`. Test vectors, with every intermediate stage, are at
+`src/test/data/block_header_v2.json`.
 
 ## Wire format, for reference
 
@@ -336,9 +327,13 @@ Header layout is in `src/primitives/block.h`, and `GetHash()` is in
 
 ## Status
 
-Nothing here is implemented yet. I am working on the indexer side in electrs and will
-report what the parsing work actually costs once it is done. If someone is already doing
-this in Fulcrum or ElectrumX, I would rather join that than duplicate it.
+The protocol changes proposed here are not implemented anywhere yet. The hash is: the
+implementation described above passes the published vectors and reproduces live block
+hashes, so the expensive-looking half of client support is known to be tractable.
+
+I am working on the indexer side in electrs and will report what the parsing work actually
+costs once it is done. If someone is already doing this in Fulcrum or ElectrumX, I would
+rather join that than duplicate it.
 
 There is precedent for specifying a layer that sits outside the node. luke-jr has said a
 BIP is to be written for the `getblocktemplate` BLAKE2b extensions, which is the same shape
