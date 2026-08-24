@@ -124,10 +124,21 @@ Deployment tells a different story. Probing public servers on 2026-08-24:
 | electrum.blockstream.info | electrs-esplora 0.4.1 | 1.4 | concatenated hex |
 
 Fulcrum is the only implementation of the four that reaches 1.6. ElectrumX caps at 1.4.3,
-and both electrs lines cap at 1.4. On the client side, Sparrow negotiates 1.4 in practice.
+and both electrs lines cap at 1.4.
 
-So the concatenated form is what almost everything actually exchanges, and a client that
-wants to follow a v2 chain cannot wait for servers to reach 1.6 first.
+The client side, read from source rather than from connection dialogs:
+
+| client | versions requested | source |
+|---|---|---|
+| Electrum | min `1.4`, max `1.6` | `electrum/version.py` |
+| Sparrow | `{"1.3", "1.4.2"}` | `ElectrumServer.java`, `SUPPORTED_VERSIONS` |
+
+So Electrum can reach 1.6 and will get the list form from a Fulcrum server. Sparrow caps at
+1.4.2 and therefore always receives the concatenated form, whatever the server supports.
+
+The concatenated form is what most pairings actually exchange, and for one of the two major
+wallets it is the only form available. A client that wants to follow a v2 chain cannot wait
+for the ecosystem to reach 1.6.
 
 That makes the self-describing marker do real work rather than being a curiosity. A client
 walks the blob: read four bytes, take 80 or 164 depending on bit 31, repeat, and check the
