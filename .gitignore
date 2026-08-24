@@ -16,3 +16,6 @@ packaging/*/javascript/
 # in ARCHITECTURE.md — keeping the electrs deltas a patch set over a pinned
 # upstream submodule is what keeps rebasing cheap.
 packaging/
+
+# Internal planning docs — not published
+internal_docs/
