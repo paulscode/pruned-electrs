@@ -153,7 +153,13 @@ Servers may want to lower `max` on a v2 chain. At 2016 headers the response roug
 ### 4. Checkpoint proofs use the chain's own block hash
 
 When `cp_height` is nonzero, `blockchain.block.header` and `blockchain.block.headers`
-return a merkle `branch` and `root` over the header chain. The leaves are block hashes.
+return a merkle `branch` and `root` over the header chain.
+
+The leaves are block hashes. Verified rather than assumed: asking ElectrumX 1.18.0 and
+Fulcrum 2.1.2 for headers 0 to 5 with `cp_height=5`, hashing those headers, and building a
+Bitcoin-style tree with last-node duplication reproduces both servers' `root` exactly, and
+the `branch` matches deepest-pairing-first. Two independent implementations agreeing rules
+out reading one server's quirk as the specification.
 
 For a v2 header, the block hash is what the chain says it is, meaning the staged BLAKE2b
 value from `CBlockHeader::GetHash()`, not SHA256d over the 164 bytes. On a chain that
@@ -163,6 +169,10 @@ SHA256d.
 
 This needs stating explicitly because "the header hash" is ambiguous once there are two
 hash functions in one chain.
+
+The practical consequence for a client is concrete: verifying a checkpoint proof that spans
+the activation height means computing SHA256d leaves below it and BLAKE2b leaves at or
+above it, in one tree. The pairing function above the leaves does not change.
 
 ### 5. Chain identity needs a field, and `genesis_hash` will not do
 
@@ -206,8 +216,12 @@ proofs as before. This is enough for a wallet that trusts its own server, which 
 common case for self-hosted setups. It needs no new hash function and no consensus code.
 
 **Full verification.** Additionally compute the v2 block hash to check proof of work and
-chain linkage. This needs the staged BLAKE2b implementation, which is more work and needs
-test vectors to get right.
+chain linkage, and to build checkpoint leaves past activation. This needs the staged
+BLAKE2b implementation.
+
+It is less work than it looks. A from-scratch implementation written against the published
+vectors, in Python, is about 120 lines including the four ASIC profile layouts, and it
+reproduces live block hashes. See below.
 
 A client that does the first and clearly says it is not verifying proof of work on this
 chain is more useful than a client that does neither, and it is a small change.
@@ -243,6 +257,34 @@ identity, not just header length, has changed.
 
 The script is `spikes/electrum-probe/verify_header_v2.py` in this repo. It is read-only
 against a public explorer API and takes a height as its argument.
+
+### The hash itself
+
+`GetHash()` was also implemented from the C++ and checked, since a proposal that says "the
+hash is different" should be able to demonstrate it.
+
+Against the published vectors in `src/test/data/block_header_v2.json`: **40 of 40 stage
+comparisons match**, covering all four ASIC profiles, both time-offset settings, and both
+null and non-null XOR keys. The vectors carry every intermediate stage, which is what made
+this quick: an initial byte-order error on `m_xor_key` showed up as a mismatch on
+`xor_key_hash`, the very first stage, rather than as a wrong final hash with no clue where
+it went wrong.
+
+Against the live chain, the same implementation reproduces the block hash exactly:
+
+```
+height 149537 (activation)  000000000068f60429c933dc0c8befbcc7edadb1cf8f8d0d7804c608fd736d82
+height 160500               0000000000143a4b1c5889b8ee9fe766dd5a1cc4c1fb142a60fffe35e79bc294
+height 169000               000000000000324e94407a3c8335ead2213d881a105b1cc6c0797e0713b26d86
+```
+
+So the path from raw header bytes, through the field layout in the table above, through the
+staged computation, to the identifier the chain actually uses, is verified end to end.
+`spikes/electrum-probe/headerv2_hash.py`, about 120 lines, no dependencies beyond hashlib.
+
+All three blocks sampled use ASIC profile 0 with a null XOR key, which is what solo mining
+produces. The other three profiles are exercised by the vectors but have not been seen in
+the wild here.
 
 ## Reference material
 
