@@ -1,0 +1,521 @@
+From 7e9eadef0e8dc796dfe84fb0320f9899cfb0a852 Mon Sep 17 00:00:00 2001
+From: pruned-electrs <paul@paulscode.com>
+Date: Tue, 25 Aug 2026 06:16:20 -0500
+Subject: [sparrow PATCH] Follow a chain whose block headers are not all 80
+ bytes
+
+The client half of docs/electrum-header-v2.md. Needs the drongo patch
+beside it, which is what actually reads and hashes a v2 header; this is
+the three places Sparrow had a literal 80 in it.
+
+VariableHeaders holds all of it, so removing support later is a file
+deletion plus reverting the call sites that name it.
+
+  - blockchain.block.headers returns one concatenated hex string below
+    protocol 1.6, and Sparrow negotiates below that, so it always
+    receives that form and has to walk it. Three call sites sliced it on
+    a fixed stride; on a chain spanning the activation a 40 header
+    response is 4964 bytes, which a fixed stride reads as 62 headers of
+    garbage. The walk reads each header's length from its own version
+    field and fails if it does not land exactly on the end.
+
+  - The on-disk store indexes by height times a stride, so the stride is
+    now per network rather than per header and an 80 byte header is
+    padded out where both can occur. Only testnet4 can, so every other
+    network is byte-for-byte as before and existing mainnet stores are
+    untouched. A store written with the other stride is already handled:
+    one whose first record does not descend from the pin is discarded and
+    re-downloaded, and a padded record cannot descend from anything.
+
+  - SUPPORTED_VERSIONS reaches 1.8. A server on a chain with v2 headers
+    refuses to negotiate below it, so this is what makes such a chain
+    reachable at all; the range is a minimum and a maximum, so servers
+    elsewhere still negotiate 1.4.2.
+
+Sparrow's checkpoints are not in the way: testnet4 pins 74 periods, so
+149183, which is 354 blocks below the activation and on shared history.
+
+Blake2bChainSyncHarness drives the whole path against a live server and
+is a main rather than a test, since it needs one. Against electrs on a
+regtest chain activating at 20: negotiated 1.8, split 40 headers into 19
+v1 and 21 v2, and HeaderChainState accepted all 40 under its linkage,
+difficulty, proof-of-work and median-time-past rules. 195 Sparrow tests
+still pass.
+---
+ .../sparrow/net/ElectrumServer.java           |  12 +-
+ .../sparrow/net/HeaderStore.java              |  45 ++++---
+ .../sparrow/net/VariableHeaders.java          | 113 ++++++++++++++++++
+ .../sparrow/net/Blake2bChainSyncHarness.java  | 104 ++++++++++++++++
+ .../sparrow/net/HeaderStoreTest.java          |  18 +--
+ 5 files changed, 265 insertions(+), 27 deletions(-)
+ create mode 100644 src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java
+ create mode 100644 src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java
+
+diff --git a/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java b/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java
+index 741a607..837e301 100644
+--- a/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java
++++ b/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java
+@@ -54,7 +54,11 @@ import java.util.stream.Stream;
+ public class ElectrumServer {
+     private static final Logger log = LoggerFactory.getLogger(ElectrumServer.class);
+ 
+-    static final String[] SUPPORTED_VERSIONS = new String[]{"1.3", "1.4.2"};
++    //1.8 adds variable-length headers; see VariableHeaders and docs/electrum-header-v2.md.
++    //A server on a chain with v2 headers refuses to negotiate below it, so advertising it
++    //is what makes such a chain reachable at all. Servers on every other chain negotiate
++    //1.4.2 as before, because the range is a minimum and a maximum.
++    static final String[] SUPPORTED_VERSIONS = new String[]{"1.3", "1.8"};
+ 
+     private static final Version ELECTRS_MIN_BATCHING_VERSION = new Version("0.9.0");
+ 
+@@ -994,7 +998,7 @@ public class ElectrumServer {
+                 //Parsed whole here rather than one at a time below, so that a chunk carrying fewer headers than it claims is a refusal like any other
+                 //malformed response rather than an exception escaping the sync
+                 byte[] bytes = Utils.hexToBytes(chunk.hex);
+-                headers = IntStream.range(0, chunk.count).mapToObj(i -> new BlockHeader(bytes, i * HeaderStore.HEADER_LENGTH)).toList();
++                headers = VariableHeaders.split(bytes, chunk.count);
+             } catch(ProtocolException | IllegalArgumentException e) {
+                 //Refusal class, as a short chunk is: the server could not substantiate the range
+                 throw new VerificationException("Server returned a malformed header chunk from height " + startHeight, e);
+@@ -1029,7 +1033,7 @@ public class ElectrumServer {
+         List<BlockHeader> candidate;
+         try {
+             byte[] bytes = Utils.hexToBytes(chunk.hex);
+-            candidate = IntStream.range(0, count).mapToObj(i -> new BlockHeader(bytes, i * HeaderStore.HEADER_LENGTH)).toList();
++            candidate = VariableHeaders.split(bytes, count);
+         } catch(ProtocolException | IllegalArgumentException e) {
+             throw new VerificationException("Server returned a malformed header chunk when reconciling to height " + endHeight, e);
+         }
+@@ -1180,7 +1184,7 @@ public class ElectrumServer {
+         List<BlockHeader> headers;
+         try {
+             byte[] bytes = Utils.hexToBytes(chunk.hex);
+-            headers = IntStream.range(0, count).mapToObj(i -> new BlockHeader(bytes, i * HeaderStore.HEADER_LENGTH)).toList();
++            headers = VariableHeaders.split(bytes, count);
+         } catch(ProtocolException | IllegalArgumentException e) {
+             return null;
+         }
+diff --git a/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java b/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java
+index b6b0bb5..4480836 100644
+--- a/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java
++++ b/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java
+@@ -21,8 +21,8 @@ import java.math.BigInteger;
+ import java.util.List;
+ 
+ /**
+- * The block headers above the last pinned checkpoint, held as a flat file of consecutive raw 80 byte records named for the height of its first record,
+- * which is the height following the last pin. The height h is stored at offset (h - startHeight) * 80, and the first record must descend from the pin,
++ * The block headers above the last pinned checkpoint, held as a flat file of consecutive fixed-width records (80 bytes, or 164 on a network that can carry BLAKE2b headers) named for the height of its first record,
++ * which is the height following the last pin. The height h is stored at offset (h - startHeight) * the record size, and the first record must descend from the pin,
+  * so that the compiled-in checkpoints and the file agree on where each height lies.
+  * <p>
+  * Nothing in the file is trusted: the whole chain is re-verified from the pinned anchor on every load, which costs a few tens of milliseconds per year
+@@ -35,7 +35,24 @@ import java.util.List;
+ public class HeaderStore {
+     private static final Logger log = LoggerFactory.getLogger(HeaderStore.class);
+ 
+-    public static final int HEADER_LENGTH = 80;
++    /**
++     * The on-disk record size.
++     *
++     * <p>No longer a constant, because a chain that has activated the BLAKE2b
++     * change carries 164 byte headers. The store still indexes by height times
++     * a fixed stride, so the stride is per network rather than per header and an
++     * 80 byte header is padded out on a network that can carry both; see
++     * {@link VariableHeaders}. Every network that cannot is byte-for-byte as
++     * before, so existing mainnet stores are untouched.
++     *
++     * <p>A store written with the other stride is unreadable, but that is
++     * already handled: a store whose first record does not descend from the pin
++     * is discarded and re-downloaded, and a padded record cannot descend from
++     * anything.
++     */
++    public static int headerLength() {
++        return VariableHeaders.recordLength();
++    }
+ 
+     private final File file;
+     private final int startHeight;      //the height of the record at offset zero, being the header immediately above the last pin
+@@ -106,12 +123,12 @@ public class HeaderStore {
+      */
+     public synchronized void append(List<BlockHeader> headers) throws IOException {
+         long offset = getOffset(chainState.getHeight() + 1);
+-        ByteArrayOutputStream accepted = new ByteArrayOutputStream(headers.size() * HEADER_LENGTH);
++        ByteArrayOutputStream accepted = new ByteArrayOutputStream(headers.size() * headerLength());
+         VerificationException rejected = null;
+         try {
+             for(BlockHeader header : headers) {
+                 chainState.add(header);
+-                accepted.writeBytes(header.bitcoinSerialize());
++                accepted.writeBytes(VariableHeaders.toRecord(header));
+             }
+         } catch(VerificationException e) {
+             rejected = e;
+@@ -230,9 +247,9 @@ public class HeaderStore {
+         }
+ 
+         //A header interrupted mid write costs only itself: the tip append is deliberately not synced, and what is lost is fetched again
+-        long records = file.length() / HEADER_LENGTH;
+-        if(records * HEADER_LENGTH != file.length()) {
+-            setLength(records * HEADER_LENGTH);
++        long records = file.length() / headerLength();
++        if(records * headerLength() != file.length()) {
++            setLength(records * headerLength());
+         }
+ 
+         rebuild();
+@@ -253,13 +270,13 @@ public class HeaderStore {
+      */
+     private HeaderChainState walkTo(long endOffset) throws IOException {
+         HeaderChainState state = checkpoints.newChainState();
+-        if(endOffset < HEADER_LENGTH) {
++        if(endOffset < headerLength()) {
+             return state;
+         }
+ 
+         try(DataInputStream inputStream = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+-            byte[] record = new byte[HEADER_LENGTH];
+-            for(long offset = 0; offset + HEADER_LENGTH <= endOffset; offset += HEADER_LENGTH) {
++            byte[] record = new byte[headerLength()];
++            for(long offset = 0; offset + headerLength() <= endOffset; offset += headerLength()) {
+                 inputStream.readFully(record);
+                 try {
+                     state.add(new BlockHeader(record, 0));
+@@ -282,13 +299,13 @@ public class HeaderStore {
+     }
+ 
+     private byte[] readRecord(long offset) throws IOException {
+-        if(offset < 0 || file.length() < offset + HEADER_LENGTH) {
++        if(offset < 0 || file.length() < offset + headerLength()) {
+             return null;
+         }
+ 
+         try(RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r")) {
+             randomAccessFile.seek(offset);
+-            byte[] record = new byte[HEADER_LENGTH];
++            byte[] record = new byte[headerLength()];
+             randomAccessFile.readFully(record);
+ 
+             return record;
+@@ -302,6 +319,6 @@ public class HeaderStore {
+     }
+ 
+     private long getOffset(int height) {
+-        return (long)(height - startHeight) * HEADER_LENGTH;
++        return (long)(height - startHeight) * headerLength();
+     }
+ }
+diff --git a/src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java b/src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java
+new file mode 100644
+index 0000000..a1e1603
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java
+@@ -0,0 +1,113 @@
++package com.sparrowwallet.sparrow.net;
++
++import com.sparrowwallet.drongo.Network;
++import com.sparrowwallet.drongo.protocol.BlockHeader;
++import com.sparrowwallet.drongo.protocol.BlockHeaderV2;
++import com.sparrowwallet.drongo.protocol.ProtocolException;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Block headers whose length is read rather than assumed.
++ *
++ * <p>A chain that has activated the BLAKE2b proof-of-work change carries
++ * 164-byte headers instead of 80, and both lengths appear in one chain: the
++ * blocks below the activation height keep the old format. Bit 31 of the version
++ * field, in the first four bytes, says which a given header is.
++ *
++ * <p>Everything in Sparrow that had a literal 80 in it routes through this
++ * class, so that removing support later is a file deletion plus reverting the
++ * call sites that name it. See {@code docs/electrum-header-v2.md} in the
++ * pruned-electrs repo for the protocol proposal this implements the client half
++ * of.
++ *
++ * <p>Two things make this necessary rather than cosmetic. The Electrum protocol
++ * returns {@code blockchain.block.headers} as one concatenated hex string below
++ * protocol 1.6, and Sparrow negotiates 1.4.2, so it always receives that form
++ * and has to walk it. And the on-disk header store indexes by height times a
++ * fixed stride, which a variable record length would break.
++ */
++public class VariableHeaders {
++    /**
++     * The on-disk record size for this network.
++     *
++     * <p>Fixed per network rather than per header, so the store keeps indexing
++     * by height times a stride and nothing else in {@link HeaderStore} has to
++     * change. A network that can carry v2 headers uses the larger record and
++     * pads an 80-byte header out; every other network is byte-for-byte as
++     * before, so mainnet stores are unaffected.
++     */
++    public static int recordLength() {
++        return supportsV2(Network.get()) ? BlockHeaderV2.HEADER_V2_LENGTH : BlockHeaderV2.HEADER_V1_LENGTH;
++    }
++
++    /**
++     * Can this network carry v2 headers?
++     *
++     * <p>testnet4 only. The BLAKE2b fork activates there at height 149537 and
++     * nowhere else: mainnet's {@code Blake2bHeight} is unscheduled, and regtest
++     * would need {@code -testactivationheight}, which is a node-side setting a
++     * wallet cannot see. Keeping this narrow means every other network takes
++     * exactly the path it took before.
++     */
++    public static boolean supportsV2(Network network) {
++        return network == Network.TESTNET4;
++    }
++
++    /**
++     * Split a concatenated run of headers, reading each one's length from its
++     * own version field.
++     *
++     * @param bytes the decoded blob
++     * @param count how many headers the server said it returned
++     * @throws ProtocolException if the walk does not consume exactly that many
++     *                           headers, or runs off the end
++     */
++    public static List<BlockHeader> split(byte[] bytes, int count) throws ProtocolException {
++        List<BlockHeader> headers = new ArrayList<>(count);
++        int offset = 0;
++        for(int i = 0; i < count; i++) {
++            if(offset + BlockHeaderV2.HEADER_V1_LENGTH > bytes.length) {
++                throw new ProtocolException("Header run ended early: wanted " + count + " headers, got " + i
++                        + " before running out at offset " + offset + " of " + bytes.length);
++            }
++            int length = BlockHeaderV2.headerLength(bytes, offset);
++            if(offset + length > bytes.length) {
++                throw new ProtocolException("Header " + i + " claims " + length + " bytes at offset " + offset
++                        + " but only " + (bytes.length - offset) + " remain");
++            }
++            headers.add(new BlockHeader(bytes, offset));
++            offset += length;
++        }
++        //Trailing bytes mean the walk and the server disagree about the format,
++        //which is worth failing on rather than silently ignoring: it is exactly
++        //what a client that assumed the wrong length would produce.
++        if(offset != bytes.length) {
++            throw new ProtocolException("Header run had " + (bytes.length - offset)
++                    + " trailing bytes after " + count + " headers");
++        }
++        return headers;
++    }
++
++    /**
++     * Serialize a header into a fixed-width record, zero padded.
++     *
++     * <p>The padding is unambiguous: the version field says how much of the
++     * record is the header, so the remainder is never read back.
++     */
++    public static byte[] toRecord(BlockHeader header) {
++        byte[] serialized = header.bitcoinSerialize();
++        int size = recordLength();
++        if(serialized.length == size) {
++            return serialized;
++        }
++        if(serialized.length > size) {
++            throw new IllegalStateException("Header of " + serialized.length
++                    + " bytes does not fit a " + size + " byte record on " + Network.get());
++        }
++        byte[] record = new byte[size];
++        System.arraycopy(serialized, 0, record, 0, serialized.length);
++        return record;
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java b/src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java
+new file mode 100644
+index 0000000..4046b5f
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java
+@@ -0,0 +1,104 @@
++package com.sparrowwallet.sparrow.net;
++
++import com.sparrowwallet.drongo.Network;
++import com.sparrowwallet.drongo.Utils;
++import com.sparrowwallet.drongo.protocol.BlockHeader;
++import com.sparrowwallet.drongo.protocol.HeaderChainState;
++import com.sparrowwallet.drongo.protocol.Sha256Hash;
++
++import java.io.BufferedReader;
++import java.io.InputStreamReader;
++import java.io.PrintWriter;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++
++/**
++ * Drives Sparrow's own header path against a live Electrum server on a BLAKE2b
++ * chain, and reports what happens.
++ *
++ * <p>Not a unit test: it needs a server, so it is a main rather than something
++ * the build runs. It exists because the unit tests prove the pieces and this
++ * proves the pieces fit: negotiation, the concatenated-blob walk, the variable
++ * header length, the BLAKE2b block hash, and {@link HeaderChainState}'s linkage,
++ * difficulty and proof-of-work rules, in the order Sparrow does them.
++ *
++ * <pre>
++ *   java -cp ... Blake2bChainSyncHarness &lt;host&gt; &lt;port&gt; &lt;network&gt; &lt;anchorHeight&gt; &lt;count&gt;
++ * </pre>
++ */
++public class Blake2bChainSyncHarness {
++    public static void main(String[] args) throws Exception {
++        String host = args.length > 0 ? args[0] : "127.0.0.1";
++        int port = args.length > 1 ? Integer.parseInt(args[1]) : 60610;
++        Network network = Network.valueOf(args.length > 2 ? args[2].toUpperCase() : "REGTEST");
++        int anchorHeight = args.length > 3 ? Integer.parseInt(args[3]) : 0;
++        int count = args.length > 4 ? Integer.parseInt(args[4]) : 30;
++        Network.set(network);
++
++        try(Socket socket = new Socket(host, port)) {
++            PrintWriter out = new PrintWriter(new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
++            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
++
++            String versions = String.join("\",\"", ElectrumServer.SUPPORTED_VERSIONS);
++            out.println("{\"id\":0,\"method\":\"server.version\",\"params\":[\"Sparrow\",[\"" + versions + "\"]]}");
++            String negotiated = in.readLine();
++            System.out.println("negotiated : " + negotiated);
++            if(negotiated == null || negotiated.contains("\"error\"")) {
++                System.out.println("REFUSED: the server would not negotiate with " + java.util.Arrays.toString(ElectrumServer.SUPPORTED_VERSIONS));
++                return;
++            }
++
++            //The anchor. On regtest height 0 is genesis, which HeaderChainState accepts.
++            out.println("{\"id\":1,\"method\":\"blockchain.block.header\",\"params\":[" + anchorHeight + "]}");
++            String anchorHex = extract(in.readLine());
++            BlockHeader anchor = new BlockHeader(Utils.hexToBytes(anchorHex));
++            Sha256Hash anchorHash = anchor.getHash();
++            System.out.println("anchor     : height " + anchorHeight + ", " + (anchorHex.length() / 2) + " bytes, hash " + anchorHash);
++
++            out.println("{\"id\":2,\"method\":\"blockchain.block.headers\",\"params\":[" + (anchorHeight + 1) + "," + count + "]}");
++            String response = in.readLine();
++            String blob = extract(response);
++            int returned = extractCount(response);
++            byte[] bytes = Utils.hexToBytes(blob);
++            System.out.println("blob       : " + bytes.length + " bytes for " + returned + " headers"
++                    + " (a fixed 80-byte stride would read " + (bytes.length / 80) + ")");
++
++            java.util.List<BlockHeader> headers = VariableHeaders.split(bytes, returned);
++            long v1 = headers.stream().filter(h -> !h.isV2()).count();
++            System.out.println("split      : " + headers.size() + " headers, " + v1 + " v1 and " + (headers.size() - v1) + " v2");
++
++            HeaderChainState state = new HeaderChainState(anchorHeight, anchorHash, anchor.getDifficultyTarget());
++            int added = 0;
++            for(BlockHeader header : headers) {
++                state.add(header);      //linkage, difficulty, proof of work, median time past
++                added++;
++            }
++            System.out.println("verified   : " + added + " headers accepted, tip height " + state.getHeight()
++                    + " hash " + state.getHash());
++            System.out.println("RESULT     : Sparrow's verification accepted a chain spanning the BLAKE2b activation.");
++        }
++    }
++
++    private static String extract(String json) {
++        int i = json.indexOf("\"hex\"");
++        int open = json.indexOf('"', json.indexOf(':', i));
++        int close = json.indexOf('"', open + 1);
++        if(i < 0) {
++            //blockchain.block.header returns a bare string result
++            int r = json.indexOf("\"result\"");
++            open = json.indexOf('"', json.indexOf(':', r));
++            close = json.indexOf('"', open + 1);
++        }
++        return json.substring(open + 1, close);
++    }
++
++    private static int extractCount(String json) {
++        int i = json.indexOf("\"count\"");
++        int colon = json.indexOf(':', i);
++        int end = colon + 1;
++        while(end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == ' ')) {
++            end++;
++        }
++        return Integer.parseInt(json.substring(colon + 1, end).trim());
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java b/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java
+index ed4ab5d..3e3ddc8 100644
+--- a/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java
++++ b/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java
+@@ -82,7 +82,7 @@ public class HeaderStoreTest {
+ 
+         assertEquals(20, store.getTipHeight());
+         assertEquals(chain.getLast().getHash(), store.getTipHash());
+-        assertEquals(20 * HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(20 * HeaderStore.headerLength(), storeFile("1").length());
+ 
+         HeaderStore reloaded = HeaderStore.load(checkpoints());
+         assertEquals(20, reloaded.getTipHeight());
+@@ -106,7 +106,7 @@ public class HeaderStoreTest {
+         //A header that does not link is refused before anything is written, so the store is left exactly as it was
+         assertThrows(VerificationException.class, () -> store.append(chain.getLast()));
+         assertEquals(1, store.getTipHeight());
+-        assertEquals(HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(HeaderStore.headerLength(), storeFile("1").length());
+     }
+ 
+     /**
+@@ -127,7 +127,7 @@ public class HeaderStoreTest {
+ 
+         assertEquals(2, store.getTipHeight());
+         assertEquals(chain.getLast().getHash(), store.getTipHash());
+-        assertEquals(2 * HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(2 * HeaderStore.headerLength(), storeFile("1").length());
+         assertEquals(2, HeaderStore.load(checkpoints()).getTipHeight());
+     }
+ 
+@@ -138,12 +138,12 @@ public class HeaderStoreTest {
+         //The tip append is deliberately not synced, so a process killed mid write leaves a partial record
+         try(RandomAccessFile randomAccessFile = new RandomAccessFile(storeFile("1"), "rw")) {
+             randomAccessFile.seek(randomAccessFile.length());
+-            randomAccessFile.write(new byte[HeaderStore.HEADER_LENGTH / 2]);
++            randomAccessFile.write(new byte[HeaderStore.headerLength() / 2]);
+         }
+ 
+         HeaderStore store = HeaderStore.load(checkpoints());
+         assertEquals(10, store.getTipHeight());
+-        assertEquals(10 * HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(10 * HeaderStore.headerLength(), storeFile("1").length());
+     }
+ 
+     @Test
+@@ -153,7 +153,7 @@ public class HeaderStoreTest {
+ 
+         //Record 9 is the header at height 10, which no longer links to the header below it
+         try(RandomAccessFile randomAccessFile = new RandomAccessFile(storeFile("1"), "rw")) {
+-            long position = 9 * HeaderStore.HEADER_LENGTH + 4;
++            long position = 9 * HeaderStore.headerLength() + 4;
+             randomAccessFile.seek(position);
+             int previousHashByte = randomAccessFile.read();
+             randomAccessFile.seek(position);
+@@ -163,7 +163,7 @@ public class HeaderStoreTest {
+         HeaderStore store = HeaderStore.load(checkpoints());
+         assertEquals(9, store.getTipHeight());
+         assertEquals(chain.get(8).getHash(), store.getTipHash());
+-        assertEquals(9 * HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(9 * HeaderStore.headerLength(), storeFile("1").length());
+ 
+         //And the store carries on from there
+         store.append(chain.get(9));
+@@ -196,7 +196,7 @@ public class HeaderStoreTest {
+         BlockHeader next = mineChain(chain.getLast(), 1).getFirst();
+         store.append(next);
+         assertEquals(11, store.getTipHeight());
+-        assertEquals(11 * HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(11 * HeaderStore.headerLength(), storeFile("1").length());
+         assertEquals(next.getHash(), HeaderStore.load(checkpoints()).getHeader(11).getHash());
+     }
+ 
+@@ -296,7 +296,7 @@ public class HeaderStoreTest {
+         HeaderStore reloaded = HeaderStore.load(checkpoints());
+         assertEquals(11, reloaded.getTipHeight());
+         assertEquals(branch.getFirst().getHash(), reloaded.getHeader(6).getHash());
+-        assertEquals(11 * HeaderStore.HEADER_LENGTH, storeFile("1").length());
++        assertEquals(11 * HeaderStore.headerLength(), storeFile("1").length());
+     }
+ 
+     @Test
+-- 
+2.43.0
+

@@ -17,8 +17,9 @@ side, one pruned, becomes worth the trouble — which is what the pruning track 
 activation at 149537, and follows new blocks as they arrive. Its tip matches `mempool.guide`, headers
 across the activation are byte-identical to the explorer's, transactions in a v2 block match, and
 merkle proofs recompute. The pruning track is complete and proven on regtest. The Electrum protocol
-surface (the [1.8 proposal](docs/electrum-header-v2.md)) is the remaining piece, and it is the only
-one that needs anyone else to agree.
+surface (the [1.8 proposal](docs/electrum-header-v2.md)) is implemented on both sides: electrs serves it,
+and a patched Sparrow follows the chain across the activation. Upstream adoption is the piece that
+still needs other people.
 
 ## Documents
 
@@ -129,6 +130,8 @@ Full numbers in [spikes/mainnet-fetch/RESULTS.md](spikes/mainnet-fetch/RESULTS.m
 | [patches/0003](patches/) | ″ | `HeaderV2`: the BLAKE2b 164-byte header type and its staged hash |
 | [patches/0004](patches/) | ″ | wire it through chain/db/index/p2p/status so a BLAKE2b chain indexes |
 | [patches/0005](patches/) | ″ | test recording that `rust-bitcoin` cannot decode a v2 block |
+| [patches/0006](patches/) | ″ | Electrum protocol 1.8: negotiate it on a v2 chain, refuse below it, report the fork point |
+| [patches/sparrow/](patches/sparrow/) | `sparrowwallet/sparrow` + `drongo` | the client half: read the header length, hash a v2 header with BLAKE2b, negotiate 1.8 |
 | [spikes/proxy-regtest/0001](spikes/proxy-regtest/) | `Start9Labs/btc-rpc-proxy` @ `1e9a625` | configurable p2p network (was mainnet-only) |
 | [spikes/proxy-regtest/0002](spikes/proxy-regtest/) | ″ | request `MSG_WITNESS_BLOCK` — fetched blocks were witness-stripped |
 | [spikes/proxy-regtest/0003](spikes/proxy-regtest/) | ″ | set `TCP_NODELAY` — removes a ~40 ms stall per fetch (71× on loopback) |
@@ -151,6 +154,7 @@ spikes/
   mainnet-fetch/  real-peer latency and concurrency benchmarks (clearnet + Tor), plus RESULTS.md
   blake2b-pruned/ pruning and BLAKE2b header v2 together, on one regtest chain
   blake2b-testnet4/ finding peers on the fork's testnet4, and the headline it commits to
+  electrum-probe/ what a fixed-80-byte client does with a v2 header, and why
 vendor/       reference checkouts (gitignored)
 ```
 

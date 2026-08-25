@@ -1,0 +1,287 @@
+From 4f7a4ad528df9532ac6cc84546add991764ac381 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Tue, 25 Aug 2026 06:02:19 -0500
+Subject: [PATCH 6/6] electrum: protocol 1.8 on a chain with v2 headers
+
+Implements the server half of docs/electrum-header-v2.md, kept in one
+place so replacing it with whatever upstream settles on means deleting a
+section of headerv2.rs and the few call sites that name it, rather than
+unpicking edits spread through electrum.rs.
+
+The negotiated version becomes a property of the chain rather than a
+constant. A chain that has produced a v2 header negotiates 1.8 and
+refuses below it; every other chain negotiates 1.4 exactly as before.
+Keyed on the tip actually being v2, not on the network name, so a chain
+below its activation height keeps working with every existing client and
+flips at the moment it crosses.
+
+The refusal is the safety-critical half, not the number. A client below
+1.8 does not fail loudly here: it reads 80 bytes of a 164-byte header,
+gets something structurally plausible, computes SHA256d over it, and
+cannot link the chain. The error says so, because a bare "unsupported
+request" would send someone hunting the wrong fault.
+
+server.features gains blake2b_fork, because genesis_hash cannot carry
+chain identity on a fork that keeps its history: this chain and ordinary
+testnet4 share a genesis block. Reported as a fork point rather than an
+opaque id, since that needs no registry and a client can check it against
+what the server then serves. The height is found by binary search over
+the header chain rather than compiled in, so it is right on regtest where
+the operator chose it.
+
+Two items in the proposal need nothing here. Header length is already
+read rather than assumed, because block.header and block.headers
+serialize whatever the header is. Checkpoint proofs are not implemented
+because electrs 0.11.1 has no cp_height at all; if that changes, leaves
+at or above the activation height must be BLAKE2b, which
+AnyHeader::block_hash already returns.
+
+Verified against a regtest chain either side of its activation height.
+Below it: Sparrow's range and Electrum's both negotiate 1.4, features
+report 1.4 and no fork point. Above it: both are refused with the
+explanation, a 1.8 client gets 1.8, and blake2b_fork reports height 20
+with the right hash, found by search rather than told.
+---
+ src/chain.rs    |  16 +++++++
+ src/electrum.rs |  61 +++++++++++++++++++++-----
+ src/headerv2.rs | 111 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 178 insertions(+), 10 deletions(-)
+
+diff --git a/src/chain.rs b/src/chain.rs
+index 7471eb7..74e26d6 100644
+--- a/src/chain.rs
++++ b/src/chain.rs
+@@ -114,6 +114,22 @@ impl Chain {
+         }
+     }
+ 
++    /// Has this chain produced a v2 header?
++    ///
++    /// The tip is enough: the header format is a one-way switch at the
++    /// activation height, so a v2 tip means the chain has crossed it and every
++    /// header from here on is v2. Cheaper than scanning, and it flips at
++    /// exactly the right moment.
++    ///
++    /// Used to decide the Electrum protocol version to negotiate; see
++    /// `headerv2::protocol_version`.
++    pub(crate) fn has_v2_headers(&self) -> bool {
++        self.headers
++            .last()
++            .map(|(_hash, header)| header.is_v2())
++            .unwrap_or(false)
++    }
++
+     /// Best block hash
+     pub(crate) fn tip(&self) -> BlockHash {
+         self.headers.last().expect("empty chain").0
+diff --git a/src/electrum.rs b/src/electrum.rs
+index 4a30e15..abd4b8d 100644
+--- a/src/electrum.rs
++++ b/src/electrum.rs
+@@ -24,7 +24,9 @@ use crate::{
+     types::ScriptHash,
+ };
+ 
+-const PROTOCOL_VERSION: &str = "1.4";
++// The protocol version is no longer a constant: it is a property of the chain,
++// because a chain with v2 headers must not negotiate below 1.8. See
++// `headerv2::protocol_version` and `Rpc::protocol_version`.
+ const UNKNOWN_FEE: isize = -1; // (allowed by Electrum protocol)
+ 
+ const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method of querying electrs, consider contacting the developer of your wallet. Reason:";
+@@ -492,25 +494,64 @@ impl Rpc {
+         format!("electrs/{}", ELECTRS_VERSION)
+     }
+ 
++    /// The version this chain negotiates. 1.4 as upstream, except on a chain
++    /// whose headers are v2, where it is 1.8; see `headerv2::protocol_version`.
++    fn protocol_version(&self) -> &'static str {
++        crate::headerv2::protocol_version(self.tracker.chain().has_v2_headers())
++    }
++
+     fn version(&self, (client_id, client_version): &(String, VersionRequest)) -> Result<Value> {
++        let version = self.protocol_version();
+         match client_version {
+-            VersionRequest::Single(exact) => check_between(PROTOCOL_VERSION, exact, exact),
+-            VersionRequest::MinMax(min, max) => check_between(PROTOCOL_VERSION, min, max),
++            VersionRequest::Single(exact) => check_between(version, exact, exact),
++            VersionRequest::MinMax(min, max) => check_between(version, min, max),
+         }
+-        .with_context(|| format!("unsupported request {:?} by {}", client_version, client_id))?;
+-        Ok(json!([self.server_id(), PROTOCOL_VERSION]))
++        .with_context(|| {
++            // Say why, because on a v2 chain this is the difference between a
++            // client that cannot work here and one that merely asked for an
++            // older version. The message reaches the client's log, and a bare
++            // "unsupported request" would send someone hunting the wrong fault.
++            if version == crate::headerv2::PROTOCOL_VERSION_V2 {
++                format!(
++                    "unsupported request {:?} by {}: this chain uses 164-byte block headers \
++                     with a BLAKE2b block hash, which a client below protocol {} cannot read. \
++                     Refusing rather than serving headers it would misinterpret.",
++                    client_version, client_id, version
++                )
++            } else {
++                format!("unsupported request {:?} by {}", client_version, client_id)
++            }
++        })?;
++        Ok(json!([self.server_id(), version]))
+     }
+ 
+     fn features(&self) -> Result<Value> {
+-        Ok(json!({
+-            "genesis_hash": self.tracker.chain().get_block_hash(0),
++        let chain = self.tracker.chain();
++        let version = self.protocol_version();
++        let mut features = json!({
++            "genesis_hash": chain.get_block_hash(0),
+             "hosts": { "tcp_port": self.port },
+-            "protocol_max": PROTOCOL_VERSION,
+-            "protocol_min": PROTOCOL_VERSION,
++            "protocol_max": version,
++            "protocol_min": version,
+             "pruning": null,
+             "server_version": self.server_id(),
+             "hash_function": "sha256"
+-        }))
++        });
++
++        // Chain identity, because `genesis_hash` cannot carry it here: this
++        // chain and ordinary testnet4 share a genesis block and diverge only at
++        // the activation height. Two servers can report the same genesis and
++        // serve chains that disagree, so a client checking only that field
++        // learns nothing.
++        //
++        // The fork point is reported rather than an opaque identifier because
++        // it needs no registry and a client can check it against what the
++        // server then serves. Absent on chains that have not forked, which is
++        // itself the answer for them.
++        if let Some(fork) = crate::headerv2::fork_point(chain) {
++            features["blake2b_fork"] = fork;
++        }
++        Ok(features)
+     }
+ 
+     pub fn handle_requests(&self, client: &mut Client, lines: &[String]) -> Vec<String> {
+diff --git a/src/headerv2.rs b/src/headerv2.rs
+index 9863c60..317b513 100644
+--- a/src/headerv2.rs
++++ b/src/headerv2.rs
+@@ -971,3 +971,114 @@ mod tests {
+         assert!(AnyHeader::parse_all(&v2[..HEADER_V2_SIZE - 1]).is_err());
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Electrum protocol 1.8
++// ---------------------------------------------------------------------------
++//
++// Everything this fork changes about the Electrum protocol lives here, so that
++// replacing it with whatever upstream settles on is a matter of deleting this
++// section and the handful of call sites that name it, rather than unpicking
++// edits spread through `electrum.rs`.
++//
++// The proposal is `docs/electrum-header-v2.md` in the pruned-electrs repo. Only
++// the parts that apply to this server are implemented:
++//
++//   1. Protocol version 1.8.
++//   2. A server on a chain with v2 headers refuses to negotiate below it.
++//   3. Header length is read, not assumed. Already true here: `block.header`
++//      and `block.headers` serialize whatever the header is, so both the
++//      concatenated and per-header forms carry the real length. Nothing to do.
++//   4. Checkpoint proofs (`cp_height`) use the chain's own block hash. Not
++//      implemented, because electrs 0.11.1 does not implement `cp_height` at
++//      all and clients tolerate its absence. If it is ever added, the leaves at
++//      or above the activation height must be BLAKE2b, and `AnyHeader::block_hash`
++//      already returns exactly that.
++//   5. Chain identity beyond `genesis_hash`, which cannot distinguish this
++//      chain from ordinary testnet4: they share a genesis block.
++
++/// The version this server negotiates on a chain whose headers are v2.
++pub const PROTOCOL_VERSION_V2: &str = "1.8";
++
++/// The version negotiated on every other chain, unchanged from upstream.
++pub const PROTOCOL_VERSION_V1: &str = "1.4";
++
++/// Which version a chain should negotiate.
++///
++/// Keyed on whether the chain has actually produced a v2 header rather than on
++/// the network name, so a chain that has not reached its activation height
++/// still speaks 1.4 and every existing client keeps working. It flips the first
++/// time a v2 header is indexed.
++///
++/// The safety-critical half is the refusal, not the number. A client below 1.8
++/// does not fail loudly on a v2 chain: it reads 80 bytes of a 164-byte header,
++/// gets a structurally plausible header, computes SHA256d over it, and cannot
++/// link the chain. Depending on the client that surfaces as a sync problem
++/// rather than an incompatibility. A closed connection is far better than a
++/// wallet that quietly believes something false.
++pub fn protocol_version(chain_has_v2: bool) -> &'static str {
++    if chain_has_v2 {
++        PROTOCOL_VERSION_V2
++    } else {
++        PROTOCOL_VERSION_V1
++    }
++}
++
++/// Where this chain's headers changed format, for `server.features`.
++///
++/// `genesis_hash` cannot answer "which chain is this" on a proof-of-work fork
++/// that keeps its history: this chain and ordinary testnet4 share a genesis
++/// block and diverge only at the activation height. Two servers can report the
++/// same genesis and serve chains that disagree from 149537 onward.
++///
++/// Reported as a fork point rather than an opaque chain id because it needs no
++/// registry and a client can verify it against what the server then serves: ask
++/// for that height's header and check it is v2 and hashes to the stated hash.
++///
++/// Returns `None` on a chain with no v2 header, which is the honest answer for
++/// every chain that has not forked.
++///
++/// Found by binary search over the header chain rather than a compiled-in
++/// height, because the format switch is monotone: once v2, always v2. That
++/// keeps this correct on regtest, where the height is whatever the operator set
++/// with `-testactivationheight`, without the server having to be told.
++pub fn fork_point(chain: &crate::chain::Chain) -> Option<serde_json::Value> {
++    if !chain.has_v2_headers() {
++        return None;
++    }
++    let (mut lo, mut hi) = (0usize, chain.height());
++    while lo < hi {
++        let mid = lo + (hi - lo) / 2;
++        match chain.get_block_header(mid) {
++            Some(h) if h.is_v2() => hi = mid,
++            _ => lo = mid + 1,
++        }
++    }
++    let header = chain.get_block_header(lo)?;
++    Some(serde_json::json!({
++        "height": lo,
++        "hash": header.block_hash().to_string(),
++        "header_bytes": HEADER_V2_SIZE,
++        "block_hash": "blake2b",
++    }))
++}
++
++#[cfg(test)]
++mod protocol_tests {
++    use super::*;
++
++    /// The negotiation rule, which is the safety-critical half of the proposal.
++    #[test]
++    fn negotiates_18_only_on_a_v2_chain() {
++        assert_eq!(protocol_version(false), "1.4");
++        assert_eq!(protocol_version(true), "1.8");
++    }
++
++    /// A chain that has not reached its activation height must keep speaking
++    /// 1.4, or every existing client breaks on a chain they can read perfectly
++    /// well. The switch is the appearance of a v2 header, not the network name.
++    #[test]
++    fn a_pre_activation_chain_is_unchanged() {
++        assert_eq!(protocol_version(false), PROTOCOL_VERSION_V1);
++    }
++}
+-- 
+2.43.0
+
