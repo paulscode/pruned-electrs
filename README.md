@@ -73,6 +73,19 @@ proposal workable.
 Every live testnet4 header so far is ASIC profile 0, solo mined (null XOR key), and does not roll
 time. The other profiles are covered only by Knots' own vectors.
 
+**Pruning and header v2 compose.** On one regtest chain with two frontiers, BLAKE2b activating at
+height 20 and the node pruned to 384, electrs indexes all 800 blocks and answers correctly at every
+combination: 364 of the indexed blocks are v2 blocks below the prune height, so they came over RPC
+rather than p2p. The routing needed no change, because it splits on `pruneheight` and never looks at
+header format. Details and the two caveats in
+[spikes/blake2b-pruned/](spikes/blake2b-pruned/).
+
+**One blocker remains for pruned BLAKE2b on StartOS: `btc-rpc-proxy` cannot serve a v2 block.** It
+decodes peer blocks with `rust-bitcoin`'s `Block` and checks a SHA256d `block_hash()`, and
+`rust-bitcoin` refuses a 164-byte header outright. That test above used a shim in its place. Teaching
+the proxy the format is separate work in a separate repo, and it is not needed for a non-pruned
+BLAKE2b node.
+
 ## Measured
 
 Real mainnet peers, clearnet, replicating the proxy's fetch path exactly:
@@ -105,6 +118,7 @@ Full numbers in [spikes/mainnet-fetch/RESULTS.md](spikes/mainnet-fetch/RESULTS.m
 | [patches/0002](patches/) | ″ | retry pruned-block RPCs, with separate budgets for indexing vs serving |
 | [patches/0003](patches/) | ″ | `HeaderV2`: the BLAKE2b 164-byte header type and its staged hash |
 | [patches/0004](patches/) | ″ | wire it through chain/db/index/p2p/status so a BLAKE2b chain indexes |
+| [patches/0005](patches/) | ″ | test recording that `rust-bitcoin` cannot decode a v2 block |
 | [spikes/proxy-regtest/0001](spikes/proxy-regtest/) | `Start9Labs/btc-rpc-proxy` @ `1e9a625` | configurable p2p network (was mainnet-only) |
 | [spikes/proxy-regtest/0002](spikes/proxy-regtest/) | ″ | request `MSG_WITNESS_BLOCK` — fetched blocks were witness-stripped |
 | [spikes/proxy-regtest/0003](spikes/proxy-regtest/) | ″ | set `TCP_NODELAY` — removes a ~40 ms stall per fetch (71× on loopback) |
@@ -125,6 +139,7 @@ spikes/
   proxy-regtest/  btc-rpc-proxy patches
   harness/        two-node regtest harness, benchmarks, Electrum + failure-mode checks
   mainnet-fetch/  real-peer latency and concurrency benchmarks (clearnet + Tor), plus RESULTS.md
+  blake2b-pruned/ pruning and BLAKE2b header v2 together, on one regtest chain
 vendor/       reference checkouts (gitignored)
 ```
 

@@ -1,0 +1,88 @@
+From b124954dace03523e65be927805cc13d0c1217a4 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 24 Aug 2026 20:08:28 -0500
+Subject: [PATCH 5/5] headerv2: record that rust-bitcoin cannot decode a v2
+ block
+
+A test rather than a change. It pins the assumption the whole module
+rests on, and it documents a consequence that reaches beyond electrs.
+
+bitcoin::consensus::deserialize::<Block> on a 164-byte-header block
+refuses with "data not consumed entirely", having read a transaction
+count of zero from offset 80 and left the rest unread. A lenient decode
+would instead yield a zero-transaction block whose SHA256d hash is not
+the block's hash.
+
+That matters because btc-rpc-proxy, which is what serves blocks bitcoind
+has pruned on StartOS, decodes peer blocks with exactly this and then
+checks block_hash() against the hash it requested. So on a BLAKE2b chain
+the proxy cannot serve a pruned block, and pruning support and header-v2
+support do not compose until the proxy is taught the format too. Proved
+separately in spikes/blake2b-pruned, which had to substitute a shim for
+the proxy to test electrs's own routing.
+---
+ src/headerv2.rs | 48 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/src/headerv2.rs b/src/headerv2.rs
+index 10bfcd2..9863c60 100644
+--- a/src/headerv2.rs
++++ b/src/headerv2.rs
+@@ -917,6 +917,54 @@ mod tests {
+         );
+     }
+ 
++    /// `rust-bitcoin`'s own block decoder on a v2 block.
++    ///
++    /// This is why `HeaderV2` exists at all, and it matters beyond electrs:
++    /// `btc-rpc-proxy`, which is what serves blocks bitcoind has pruned, decodes
++    /// peer blocks with exactly this and then checks `block_hash()` against the
++    /// hash it asked for. So on a BLAKE2b chain the proxy cannot serve a pruned
++    /// block, and the pruning support and the header-v2 support do not compose
++    /// until the proxy is taught the format too.
++    ///
++    /// Observed: strict `deserialize` refuses with "data not consumed entirely",
++    /// having read a transaction count of zero from offset 80 and left the rest
++    /// of the block unread. A lenient decode would instead yield a
++    /// zero-transaction block whose SHA256d hash is not the block's hash. Either
++    /// way the proxy's check fails.
++    #[test]
++    fn rust_bitcoin_mishandles_a_v2_block() {
++        let doc: serde_json::Value =
++            serde_json::from_str(include_str!("tests/blake2b_regtest.json")).unwrap();
++        let entry = &doc["blocks"]["131"];
++        let block = bytes(&entry["raw"]);
++        let real_ntx = entry["ntx"].as_u64().unwrap() as usize;
++        let real_hash = entry["hash"].as_str().unwrap();
++
++        match bitcoin::consensus::deserialize::<bitcoin::Block>(&block) {
++            Err(_) => { /* fine: it refuses, loudly */ }
++            Ok(b) => {
++                // It did not refuse. Then it must at least be wrong, or this
++                // whole module is unnecessary.
++                assert_ne!(
++                    b.block_hash().to_string(),
++                    real_hash,
++                    "rust-bitcoin computed the correct BLAKE2b block hash, which it cannot do"
++                );
++                assert_ne!(
++                    b.txdata.len(),
++                    real_ntx,
++                    "rust-bitcoin found the right transaction count in a v2 block"
++                );
++            }
++        }
++
++        // And the same bytes through AnyHeader give the hash the node reported.
++        assert_eq!(
++            AnyHeader::parse(&block).unwrap().block_hash().to_string(),
++            real_hash
++        );
++    }
++
+     #[test]
+     fn rejects_a_truncated_run() {
+         let v2 = bytes(&vectors()[0]["serialized"]);
+-- 
+2.43.0
+
