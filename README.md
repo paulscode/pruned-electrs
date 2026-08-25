@@ -13,10 +13,12 @@ testnet4 from height 149537. Both changes are consensus, so on that chain electr
 parse, hash or serve a single header. Supporting it is the point at which running two nodes side by
 side, one pruned, becomes worth the trouble — which is what the pruning track is for.
 
-**Status:** pruning track complete and proven on regtest; three StartOS packages built and
-installed on a test server. Header v2 track: **electrs indexes a BLAKE2b chain end to end** and
-agrees with the node on transactions, balances and merkle proofs. The Electrum protocol surface
-(the [1.8 proposal](docs/electrum-header-v2.md)) is the remaining piece.
+**Status: electrs serves the live BLAKE2b testnet4.** It indexed all 170,086 blocks, crossed the
+activation at 149537, and follows new blocks as they arrive. Its tip matches `mempool.guide`, headers
+across the activation are byte-identical to the explorer's, transactions in a v2 block match, and
+merkle proofs recompute. The pruning track is complete and proven on regtest. The Electrum protocol
+surface (the [1.8 proposal](docs/electrum-header-v2.md)) is the remaining piece, and it is the only
+one that needs anyone else to agree.
 
 ## Documents
 
