@@ -80,6 +80,14 @@ rather than p2p. The routing needed no change, because it splits on `pruneheight
 header format. Details and the two caveats in
 [spikes/blake2b-pruned/](spikes/blake2b-pruned/).
 
+**The fork's testnet4 is reachable**, which was not obvious: its DNS seeds return ordinary
+testnet4 nodes, since the fork shares testnet4's genesis, port and magic bytes. A scan of ~14k
+addresses found **18 peers on the BLAKE2b chain**, identified by asking each for the headers after
+block 149536 and checking whether the answer was 164 or 80 bytes. A second requirement is
+`blake2b_headline=Totoro`, which that chain committed to in its activation block; get it wrong and
+the node rejects block 149537 and stalls indistinguishably from having no peers. Tool, findings and
+an end-to-end sync in [spikes/blake2b-testnet4/](spikes/blake2b-testnet4/).
+
 **One blocker remains for pruned BLAKE2b on StartOS: `btc-rpc-proxy` cannot serve a v2 block.** It
 decodes peer blocks with `rust-bitcoin`'s `Block` and checks a SHA256d `block_hash()`, and
 `rust-bitcoin` refuses a 164-byte header outright. That test above used a shim in its place. Teaching
@@ -140,6 +148,7 @@ spikes/
   harness/        two-node regtest harness, benchmarks, Electrum + failure-mode checks
   mainnet-fetch/  real-peer latency and concurrency benchmarks (clearnet + Tor), plus RESULTS.md
   blake2b-pruned/ pruning and BLAKE2b header v2 together, on one regtest chain
+  blake2b-testnet4/ finding peers on the fork's testnet4, and the headline it commits to
 vendor/       reference checkouts (gitignored)
 ```
 
