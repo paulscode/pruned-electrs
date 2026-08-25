@@ -14,8 +14,9 @@ parse, hash or serve a single header. Supporting it is the point at which runnin
 side, one pruned, becomes worth the trouble — which is what the pruning track is for.
 
 **Status:** pruning track complete and proven on regtest; three StartOS packages built and
-installed on a test server. Header v2 track: wire format and hash verified against live testnet4,
-`HeaderV2` implemented ([patches/0003](patches/)), not yet wired into the index.
+installed on a test server. Header v2 track: **electrs indexes a BLAKE2b chain end to end** and
+agrees with the node on transactions, balances and merkle proofs. The Electrum protocol surface
+(the [1.8 proposal](docs/electrum-header-v2.md)) is the remaining piece.
 
 ## Documents
 
@@ -48,8 +49,21 @@ second leg is `getrawtransaction`, which the proxy does not intercept.
 `HeaderV2` and `AnyHeader` are implemented in [patches/0003](patches/) and tested against two
 independent oracles: the five vectors Knots publishes in `block_header_v2.json`, checked stage by
 stage, and four headers taken off live testnet4 (149537, the activation block; 149538, which chains
-onto it; 160500; 169000). Nothing calls them yet — substituting them for `bitcoin::block::Header`
-across `chain`/`index`/`status`/`electrum` is the next change.
+onto it; 160500; 169000).
+
+[patches/0004](patches/) wires them through `chain`, `types`, `db`, `index`, `p2p`, `status`,
+`tracker` and `electrum`. Against a Knots `v29.4.1.knots20260508rc2` regtest node with activation
+at height 20, electrs indexes all 132 blocks (19 v1, 113 v2), reaches the node's own
+`bestblockhash`, and agrees with the node on every transaction at every height, on scripthash
+history and balances to the satoshi for addresses paid in v2 blocks, and on merkle proofs that
+recompute to each header's own merkle root.
+
+The obstacle was `bitcoin_slices`, not `rust-bitcoin`: `bsl::Block::visit` reads the
+transaction-count varint from a hardcoded offset 80, which on a 164-byte header lands inside
+`m_nonce2`. It does not reliably error. On our fixture it reads a count of zero, returns `Ok` and
+visits nothing, so a four-transaction block indexes as empty with no error anywhere.
+`headerv2::visit_block_txs` replaces the few lines of `Block::visit` that assume the offset, using
+that crate's own public `scan_len` and `Transaction` for everything else.
 
 The format is self-describing: bit 31 of the version field, in the first four bytes, marks v2. So a
 run of headers spanning the transition is parseable without either side knowing an activation
@@ -65,7 +79,7 @@ Real mainnet peers, clearnet, replicating the proxy's fetch path exactly:
 
 | | median per block | full chain (900k, sequential) |
 |---|---|---|
-| with `TCP_NODELAY` (patch 0003) | **162 ms** | 40.5 h |
+| with `TCP_NODELAY` (proxy patch 0003) | **162 ms** | 40.5 h |
 | without (upstream proxy) | 544 ms | 136 h |
 
 Latency is flat in block size (0.25 MB and 1.92 MB cost the same within 13%) — the fetch is
@@ -90,6 +104,7 @@ Full numbers in [spikes/mainnet-fetch/RESULTS.md](spikes/mainnet-fetch/RESULTS.m
 | [patches/0001](patches/) | `romanz/electrs` @ `v0.11.1` | route blocks below `pruneheight` to RPC |
 | [patches/0002](patches/) | ″ | retry pruned-block RPCs, with separate budgets for indexing vs serving |
 | [patches/0003](patches/) | ″ | `HeaderV2`: the BLAKE2b 164-byte header type and its staged hash |
+| [patches/0004](patches/) | ″ | wire it through chain/db/index/p2p/status so a BLAKE2b chain indexes |
 | [spikes/proxy-regtest/0001](spikes/proxy-regtest/) | `Start9Labs/btc-rpc-proxy` @ `1e9a625` | configurable p2p network (was mainnet-only) |
 | [spikes/proxy-regtest/0002](spikes/proxy-regtest/) | ″ | request `MSG_WITNESS_BLOCK` — fetched blocks were witness-stripped |
 | [spikes/proxy-regtest/0003](spikes/proxy-regtest/) | ″ | set `TCP_NODELAY` — removes a ~40 ms stall per fetch (71× on loopback) |

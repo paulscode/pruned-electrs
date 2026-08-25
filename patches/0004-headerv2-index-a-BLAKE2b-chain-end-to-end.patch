@@ -1,0 +1,1358 @@
+From af33419201a70f915a49559361351e89999e6414 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 24 Aug 2026 19:54:16 -0500
+Subject: [PATCH 4/4] headerv2: index a BLAKE2b chain end to end
+
+Wires HeaderV2 and AnyHeader through the parts of electrs that touch a
+header: chain, types, db, index, p2p, status, tracker, electrum. Before
+this, the type existed but nothing used it.
+
+Verified against a real BLAKE2b chain, not only unit tests. Against a
+Bitcoin Knots v29.4.1.knots20260508rc2 regtest node with activation at
+height 20, electrs indexed all 132 blocks (19 v1, 113 v2), reached the
+node's own bestblockhash, and then agreed with the node on:
+
+  - every transaction at every height, via transaction.id_from_pos
+  - scripthash history, balance and utxos for addresses paid in v2
+    blocks, to the satoshi
+  - merkle proofs that recompute to each header's own merkle root
+
+Three things worth calling out.
+
+**bitcoin_slices was the real obstacle, not rust-bitcoin.** Every block
+electrs parses goes through bsl::Block::visit, which reads the
+transaction-count varint from a hardcoded offset 80. On a 164-byte
+header that offset lands inside m_nonce2. It does not reliably error: on
+the fixture block it reads a count of zero, returns Ok, and visits
+nothing, so a four-transaction block indexes as empty and nothing
+anywhere reports a problem. Rather than fork the crate, visit_block_txs
+reimplements the eight lines of Block::visit that matter using its
+public scan_len and Transaction; the transaction parsing, which is all
+of the cost, is still theirs and unchanged.
+
+**The v2 payload in AnyHeader is boxed.** Chain holds one header per
+block for the whole chain, so this type's size is multiplied by height.
+Inline, the enum is 168 bytes and a 900k-block v1 chain would go from
+about 100 MB resident to 180 MB for no benefit, since every header on
+such a chain is v1. Boxed, it is 88 bytes and only v2 headers pay an
+allocation. A test asserts the size so this cannot be undone by
+accident. The cost is that AnyHeader is Clone, not Copy.
+
+**Stored rows are decoded by length, network bytes by the version bit.**
+AnyHeader::parse reads bit 31 exactly as Knots does (CBlockHeader's
+SERIALIZE_METHODS branches on it with no activation-height gate), so on
+the wire this code stands where consensus stands. But rows read back out
+of our own database use parse_exact, which trusts the row's length,
+because we wrote it. That keeps stored data readable regardless of
+whether some historical miner ever set the top version bit. Header rows
+are RocksDB keys, which are already variable-length, so the storage
+format needed no change beyond letting the length vary; iter_headers
+gained its own iterator since DBIterator<N> filters on a fixed key size,
+which was also what kept the one-byte TIP_KEY out of the results.
+
+Missed on the first pass: filter_block_txs_outputs, filter_block_txs_inputs
+and lookup_transaction also called bsl::Block::visit. The substitution
+skipped them because they name no header type at all. Unit tests did not
+catch it; the end-to-end run did, as an empty scripthash.get_history for
+an address that had been paid. There is now a status.rs test on a v2
+fixture block that fails if that walker comes back, confirmed by
+reverting the fix.
+
+Fixtures in src/tests/blake2b_regtest.json are a regtest chain crossing
+the activation: headers 1..24, and whole blocks at 19, 20 and 131. The
+gitignore negation widened from one file to src/tests/*.json.
+
+fmt clean, clippy clean, 32 tests passing, up from 30.
+---
+ .gitignore                     |   4 +-
+ src/chain.rs                   | 137 ++++++++++++++---
+ src/db.rs                      |  50 +++++-
+ src/electrum.rs                |  13 +-
+ src/headerv2.rs                | 272 ++++++++++++++++++++++++++++++++-
+ src/index.rs                   |  38 +++--
+ src/p2p.rs                     |  44 ++++--
+ src/status.rs                  |  61 +++++++-
+ src/tests/blake2b_regtest.json | 144 +++++++++++++++++
+ src/tracker.rs                 |  14 +-
+ src/types.rs                   |  40 ++---
+ 11 files changed, 728 insertions(+), 89 deletions(-)
+ create mode 100644 src/tests/blake2b_regtest.json
+
+diff --git a/.gitignore b/.gitignore
+index 03cccdb..4198a1e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,5 +16,5 @@ tests/bin
+ *.json
+ 
+ # Test vectors are checked in, unlike the *.json above (bitcoind cookies,
+-# generated fixtures). Needed by src/headerv2.rs via include_str!.
+-!/src/tests/block_header_v2.json
++# generated fixtures). Needed by src/headerv2.rs and src/chain.rs via include_str!.
++!/src/tests/*.json
+diff --git a/src/chain.rs b/src/chain.rs
+index a55e50d..7471eb7 100644
+--- a/src/chain.rs
++++ b/src/chain.rs
+@@ -1,20 +1,21 @@
+ use std::collections::HashMap;
+ 
+-use bitcoin::blockdata::block::Header as BlockHeader;
+ use bitcoin::{BlockHash, Network};
+ 
++use crate::headerv2::AnyHeader;
++
+ /// A new header found, to be added to the chain at specific height
+ pub(crate) struct NewHeader {
+-    header: BlockHeader,
++    header: AnyHeader,
+     hash: BlockHash,
+     height: usize,
+ }
+ 
+ impl NewHeader {
+-    pub(crate) fn from((header, height): (BlockHeader, usize)) -> Self {
++    pub(crate) fn from((header, height): (AnyHeader, usize)) -> Self {
+         Self {
+-            header,
+             hash: header.block_hash(),
++            header,
+             height,
+         }
+     }
+@@ -30,7 +31,7 @@ impl NewHeader {
+ 
+ /// Current blockchain headers' list
+ pub struct Chain {
+-    headers: Vec<(BlockHash, BlockHeader)>,
++    headers: Vec<(BlockHash, AnyHeader)>,
+     heights: HashMap<BlockHash, usize>,
+ }
+ 
+@@ -40,7 +41,7 @@ impl Chain {
+         let genesis = bitcoin::blockdata::constants::genesis_block(network);
+         let genesis_hash = genesis.block_hash();
+         Self {
+-            headers: vec![(genesis_hash, genesis.header)],
++            headers: vec![(genesis_hash, AnyHeader::V1(genesis.header))],
+             heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
+         }
+     }
+@@ -51,29 +52,30 @@ impl Chain {
+         }
+         let new_height = self.height().saturating_sub(n);
+         self.update(vec![NewHeader::from((
+-            self.headers[new_height].1,
++            self.headers[new_height].1.clone(),
+             new_height,
+         ))]);
+     }
+ 
+     /// Load the chain from a collection of headers, up to the given tip
+-    pub(crate) fn load(&mut self, headers: impl Iterator<Item = BlockHeader>, tip: BlockHash) {
++    pub(crate) fn load(&mut self, headers: impl Iterator<Item = AnyHeader>, tip: BlockHash) {
+         let genesis_hash = self.headers[0].0;
+ 
+-        let header_map: HashMap<BlockHash, BlockHeader> =
++        let header_map: HashMap<BlockHash, AnyHeader> =
+             headers.map(|h| (h.block_hash(), h)).collect();
+         let mut blockhash = tip;
+-        let mut new_headers: Vec<&BlockHeader> = Vec::with_capacity(header_map.len());
++        let mut new_headers: Vec<&AnyHeader> = Vec::with_capacity(header_map.len());
+         while blockhash != genesis_hash {
+             let header = match header_map.get(&blockhash) {
+                 Some(header) => header,
+                 None => panic!("missing header {} while loading from DB", blockhash),
+             };
+-            blockhash = header.prev_blockhash;
++            blockhash = header.prev_blockhash();
+             new_headers.push(header);
+         }
+         info!("loading {} headers, tip={}", new_headers.len(), tip);
+-        let new_headers = new_headers.into_iter().rev().copied(); // order by height
++        // `cloned`, not `copied`: AnyHeader boxes its v2 payload so it is not Copy.
++        let new_headers = new_headers.into_iter().rev().cloned(); // order by height
+         self.update(new_headers.zip(1..).map(NewHeader::from).collect())
+     }
+ 
+@@ -83,7 +85,7 @@ impl Chain {
+     }
+ 
+     /// Get the block header at specified height (if exists)
+-    pub(crate) fn get_block_header(&self, height: usize) -> Option<&BlockHeader> {
++    pub(crate) fn get_block_header(&self, height: usize) -> Option<&AnyHeader> {
+         self.headers.get(height).map(|(_hash, header)| header)
+     }
+ 
+@@ -145,11 +147,104 @@ impl Chain {
+ #[cfg(test)]
+ mod tests {
+     use super::{Chain, NewHeader};
+-    use bitcoin::blockdata::block::Header as BlockHeader;
+-    use bitcoin::consensus::deserialize;
++    use crate::headerv2::AnyHeader;
+     use bitcoin::Network::Regtest;
+     use hex_lit::hex;
+ 
++    /// The header chain across the BLAKE2b activation.
++    ///
++    /// This is the case `Chain` exists to get right and the one that motivated
++    /// the whole change: heights 1..19 are 80-byte v1 headers, 20 onward are
++    /// 164-byte v2 headers with BLAKE2b hashes, and they link into one chain.
++    /// Captured from Bitcoin Knots `v29.4.1.knots20260508rc2` on regtest with
++    /// `-testactivationheight=blake2b@20`; see `src/tests/blake2b_regtest.json`.
++    #[test]
++    fn crosses_the_blake2b_activation() {
++        let raw = include_str!("tests/blake2b_regtest.json");
++        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
++        let activation = doc["activation_height"].as_u64().unwrap() as usize;
++
++        let mut expected = Vec::new();
++        let headers: Vec<AnyHeader> = doc["headers"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|e| {
++                let bytes = <Vec<u8> as bitcoin::hashes::hex::FromHex>::from_hex(
++                    e["header"].as_str().unwrap(),
++                )
++                .unwrap();
++                let height = e["height"].as_u64().unwrap() as usize;
++                let header = AnyHeader::parse(&bytes).unwrap();
++                // The captured hash is what the node itself reported, so this
++                // checks BLAKE2b identity against the node, not against us.
++                assert_eq!(
++                    header.block_hash().to_string(),
++                    e["hash"].as_str().unwrap(),
++                    "height {}",
++                    height
++                );
++                assert_eq!(
++                    header.is_v2(),
++                    height >= activation,
++                    "height {} has the wrong header version",
++                    height
++                );
++                assert_eq!(header.serialize(), bytes, "height {} roundtrip", height);
++                expected.push((height, header.clone()));
++                header
++            })
++            .collect();
++        assert!(
++            expected.iter().any(|(_, h)| h.is_v2()) && expected.iter().any(|(_, h)| !h.is_v2()),
++            "fixture must span the boundary to be worth anything"
++        );
++
++        // Build the chain incrementally, in every chunking, exactly as the
++        // v1-only test above does. A chunk boundary landing on the activation
++        // is the interesting case and this covers all of them.
++        for chunk_size in 1..headers.len() {
++            let mut regtest = Chain::new(Regtest);
++            let mut height = 0;
++            for chunk in headers.chunks(chunk_size) {
++                let mut update = vec![];
++                for header in chunk {
++                    height += 1;
++                    update.push(NewHeader::from((header.clone(), height)));
++                }
++                regtest.update(update);
++            }
++            assert_eq!(regtest.height(), headers.len());
++            assert_eq!(regtest.tip(), headers.last().unwrap().block_hash());
++        }
++
++        // Load from a flat set of headers plus a tip, which is the path taken
++        // when reopening the database. This walks backwards over
++        // `prev_blockhash`, so it fails if the boundary breaks the linkage.
++        let mut regtest = Chain::new(Regtest);
++        regtest.load(
++            headers.iter().cloned(),
++            headers.last().unwrap().block_hash(),
++        );
++        assert_eq!(regtest.height(), headers.len());
++        for (height, header) in &expected {
++            assert_eq!(regtest.get_block_header(*height), Some(header));
++            assert_eq!(regtest.get_block_hash(*height), Some(header.block_hash()));
++            assert_eq!(
++                regtest.get_block_height(&header.block_hash()),
++                Some(*height)
++            );
++        }
++
++        // And unwinding back across the boundary, as a reorg would.
++        for i in (0..=headers.len()).rev() {
++            assert_eq!(regtest.height(), i);
++            assert_eq!(regtest.tip(), regtest.get_block_hash(i).unwrap());
++            regtest.drop_last_headers(1);
++        }
++        assert_eq!(regtest.height(), 0);
++    }
++
+     #[test]
+     fn test_genesis() {
+         let regtest = Chain::new(Regtest);
+@@ -176,9 +271,9 @@ hex!("000000205873f322b333933e656b07881bb399dae61a6c0fa74188b5fb0e3dd71c9e2442f9
+ hex!("00000020fd1120713506267f1dba2e1856ca1d4490077d261cde8d3e182677880df0d856bf94cfa5e189c85462813751ab4059643759ed319a81e0617113758f8adf67bc2061cc60ffff7f2000000000"),
+ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a2061cc60ffff7f2002000000"),
+         ];
+-        let headers: Vec<BlockHeader> = byte_headers
++        let headers: Vec<AnyHeader> = byte_headers
+             .iter()
+-            .map(|byte_header| deserialize(byte_header).unwrap())
++            .map(|byte_header| AnyHeader::parse(byte_header).unwrap())
+             .collect();
+ 
+         for chunk_size in 1..headers.len() {
+@@ -190,7 +285,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
+                 for header in chunk {
+                     height += 1;
+                     tip = header.block_hash();
+-                    update.push(NewHeader::from((*header, height)))
++                    update.push(NewHeader::from((header.clone(), height)))
+                 }
+                 regtest.update(update);
+                 assert_eq!(regtest.tip(), tip);
+@@ -203,7 +298,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
+         // test loading from a list of headers and tip
+         let mut regtest = Chain::new(Regtest);
+         regtest.load(
+-            headers.iter().copied(),
++            headers.iter().cloned(),
+             headers.last().unwrap().block_hash(),
+         );
+         assert_eq!(regtest.height(), headers.len());
+@@ -243,12 +338,12 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
+         // test reorg
+         let mut regtest = Chain::new(Regtest);
+         regtest.load(
+-            headers.iter().copied(),
++            headers.iter().cloned(),
+             headers.last().unwrap().block_hash(),
+         );
+         let height = regtest.height();
+ 
+-        let new_header: BlockHeader = deserialize(&hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a7a6bcc60ffff7f2000000000")).unwrap();
++        let new_header = AnyHeader::parse(&hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a0304d2e55fe0b6415949cff9bca0f88c0717884a5e5797509f89f856af93624a7a6bcc60ffff7f2000000000")).unwrap();
+         regtest.update(vec![NewHeader::from((new_header, height))]);
+         assert_eq!(regtest.height(), height);
+         assert_eq!(
+diff --git a/src/db.rs b/src/db.rs
+index c6b156b..28d83b2 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -4,6 +4,7 @@ use rust_rocksdb as rocksdb;
+ use std::path::Path;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
++use crate::headerv2::{HEADER_V1_SIZE, HEADER_V2_SIZE};
+ use crate::types::{HashPrefix, SerializedHashPrefixRow, SerializedHeaderRow};
+ 
+ #[derive(Default)]
+@@ -270,10 +271,20 @@ impl DBStore {
+         self.iter_cf(cf, opts, Some(prefix))
+     }
+ 
++    /// Iterate the stored block headers, of either version.
++    ///
++    /// Header rows are variable length now (80 bytes for v1, 164 for v2), so
++    /// this cannot use `DBIterator<N>`, whose whole filtering rule is "keep keys
++    /// of exactly N bytes". That rule was also what skipped `TIP_KEY`, which
++    /// lives in this same column family and is one byte, so the replacement has
++    /// to keep skipping it: `HeaderIterator` accepts only the two header sizes,
++    /// which excludes the tip key by construction rather than by name.
+     pub(crate) fn iter_headers(&self) -> impl Iterator<Item = SerializedHeaderRow> + '_ {
+         let mut opts = rocksdb::ReadOptions::default();
+         opts.fill_cache(false);
+-        self.iter_cf(self.headers_cf(), opts, None)
++        let mut raw = self.db.raw_iterator_cf_opt(self.headers_cf(), opts);
++        raw.seek_to_first();
++        HeaderIterator { raw, done: false }
+     }
+ 
+     pub(crate) fn get_tip(&self) -> Option<Vec<u8>> {
+@@ -432,6 +443,43 @@ impl<const N: usize> Iterator for DBIterator<'_, N> {
+     }
+ }
+ 
++/// Scans the `headers` column family, yielding rows of any legal header size.
++///
++/// Deliberately not a `DBIterator<N>`: header rows stopped being fixed width
++/// when v2 arrived. Anything that is not one of the two header sizes is skipped,
++/// which is how `TIP_KEY` (one byte, same column family) stays out of the
++/// results without this needing to know its name.
++struct HeaderIterator<'a> {
++    raw: rocksdb::DBRawIterator<'a>,
++    done: bool,
++}
++
++impl Iterator for HeaderIterator<'_> {
++    type Item = SerializedHeaderRow;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        while !self.done {
++            let key = match self.raw.key() {
++                Some(key) => key,
++                None => {
++                    self.raw.status().expect("DB scan failed");
++                    break; // end of scan
++                }
++            };
++            let row = match key.len() {
++                HEADER_V1_SIZE | HEADER_V2_SIZE => Some(key.to_vec()),
++                _ => None, // TIP_KEY, or anything else that is not a header
++            };
++            self.raw.next();
++            if let Some(row) = row {
++                return Some(row);
++            }
++        }
++        self.done = true;
++        None
++    }
++}
++
+ impl Drop for DBStore {
+     fn drop(&mut self) {
+         info!("closing DB at {}", self.db.path().display());
+diff --git a/src/electrum.rs b/src/electrum.rs
+index fa67b1d..4a30e15 100644
+--- a/src/electrum.rs
++++ b/src/electrum.rs
+@@ -1,9 +1,6 @@
+ use anyhow::{bail, Context, Result};
+ use bitcoin::{
+-    consensus::{deserialize, encode::serialize_hex},
+-    hashes::hex::FromHex,
+-    hex::DisplayHex,
+-    BlockHash, Transaction, Txid,
++    consensus::deserialize, hashes::hex::FromHex, hex::DisplayHex, BlockHash, Transaction, Txid,
+ };
+ use crossbeam_channel::Receiver;
+ use rayon::prelude::*;
+@@ -219,7 +216,7 @@ impl Rpc {
+                 let header = chain.get_block_header(height).unwrap();
+                 notifications.push(notification(
+                     "blockchain.headers.subscribe",
+-                    &[json!({"hex": serialize_hex(&header), "height": height})],
++                    &[json!({"hex": header.serialize_hex(), "height": height})],
+                 ));
+             }
+         }
+@@ -231,7 +228,7 @@ impl Rpc {
+         client.tip = Some(chain.tip());
+         let height = chain.height();
+         let header = chain.get_block_header(height).unwrap();
+-        Ok(json!({"hex": serialize_hex(header), "height": height}))
++        Ok(json!({"hex": header.serialize_hex(), "height": height}))
+     }
+ 
+     fn block_header(&self, (height,): (usize,)) -> Result<Value> {
+@@ -240,7 +237,7 @@ impl Rpc {
+             None => bail!("no header at {}", height),
+             Some(header) => header,
+         };
+-        Ok(json!(serialize_hex(header)))
++        Ok(json!(header.serialize_hex()))
+     }
+ 
+     fn block_headers(&self, (start_height, count): (usize, usize)) -> Result<Value> {
+@@ -254,7 +251,7 @@ impl Rpc {
+         let heights = start_height..end_height;
+         let count = heights.len();
+         let hex_headers =
+-            heights.filter_map(|height| chain.get_block_header(height).map(serialize_hex));
++            heights.filter_map(|height| chain.get_block_header(height).map(|h| h.serialize_hex()));
+ 
+         Ok(json!({"count": count, "hex": String::from_iter(hex_headers), "max": max_count}))
+     }
+diff --git a/src/headerv2.rs b/src/headerv2.rs
+index f18f562..10bfcd2 100644
+--- a/src/headerv2.rs
++++ b/src/headerv2.rs
+@@ -15,9 +15,12 @@
+ //! bytes on the wire, marks v2, so a stream mixing both is parseable without
+ //! anyone agreeing an activation height.
+ 
+-// The accessors exist for the substitution in the next step, which replaces
+-// `bitcoin::block::Header` throughout chain/index/status/electrum. Until then
+-// the enum has no callers outside the tests. Drop this when that lands.
++// This module implements a published format in full, not only the subset
++// electrs currently reads off a header. `Stages` exists so the published test
++// vectors can be checked stage by stage, `parse_all` is what serving
++// `blockchain.block.headers` across the transition will need, and the remaining
++// accessors round out the type. Keeping them costs nothing and deleting them
++// would have to be undone.
+ #![allow(dead_code)]
+ 
+ use anyhow::{bail, ensure, Result};
+@@ -295,6 +298,52 @@ impl HeaderV2 {
+     }
+ }
+ 
++/// Walk a serialized block's transactions, feeding a `bitcoin_slices` visitor.
++///
++/// A drop-in replacement for `bsl::Block::visit` for the one thing electrs uses
++/// it for. `bsl::Block::visit` cannot be used on a v2 chain: it parses exactly
++/// 80 bytes of header and then reads the transaction-count varint from offset
++/// 80, so on a 164-byte header it would take 84 bytes of header as the count and
++/// every transaction after it would be garbage. It is not a parse error, which
++/// is what makes it dangerous: it silently indexes nonsense.
++///
++/// Rather than fork `bitcoin_slices`, this reimplements the eight lines of
++/// `Block::visit` that matter, using its public `scan_len` and `Transaction`.
++/// The transaction parsing, which is all of the cost, is unchanged and still
++/// theirs. `header` is passed in rather than re-parsed because the caller
++/// already needs it.
++///
++/// The visitor's `visit_block_header` hook is deliberately *not* called: it
++/// takes a `bsl::BlockHeader`, which cannot represent a v2 header, so a visitor
++/// relying on it would silently see nothing. Callers take the header from the
++/// `header` argument instead.
++pub fn visit_block_txs<V: bitcoin_slices::Visitor>(
++    block: &[u8],
++    header: &AnyHeader,
++    visitor: &mut V,
++) -> Result<()> {
++    use bitcoin_slices::{bsl, Visit};
++
++    let mut consumed = header.size();
++    ensure!(
++        block.len() > consumed,
++        "block is {} bytes, shorter than its own {}-byte header plus a transaction count",
++        block.len(),
++        consumed
++    );
++
++    let total_txs = bsl::scan_len(&block[consumed..], &mut consumed)
++        .map_err(|e| anyhow!("bad transaction count: {:?}", e))? as usize;
++
++    visitor.visit_block_begin(total_txs);
++    for i in 0..total_txs {
++        let tx = bsl::Transaction::visit(&block[consumed..], visitor)
++            .map_err(|e| anyhow!("bad transaction at index {}: {:?}", i, e))?;
++        consumed += tx.consumed();
++    }
++    Ok(())
++}
++
+ /// Intermediate values of `block_hash`, in display order, matching the field
+ /// names in Knots' `block_header_v2.json`.
+ #[derive(Debug, Clone)]
+@@ -315,13 +364,44 @@ pub struct Stages {
+ /// Exists so the rest of electrs can hold "a header" without caring which, and
+ /// so the substitution for `bitcoin::block::Header` is mechanical. The accessors
+ /// cover exactly what electrs reads off a header today.
++///
++/// **The v2 payload is boxed on purpose.** `Chain` keeps every header of the
++/// chain in memory, so this type's size is multiplied by the height. Inline, the
++/// enum would be 168 bytes and a 900k-block v1 chain would grow from about
++/// 100 MB to 180 MB for no benefit, since on such a chain every header is v1.
++/// Boxed, the enum is the size of a v1 header plus a discriminant, so a v1 chain
++/// costs what it costs today and only v2 headers pay an allocation. That matters
++/// here: this runs on Umbrel and StartOS boxes, often alongside a second node.
++///
++/// The cost of boxing is that `AnyHeader` is `Clone` but not `Copy`, unlike
++/// `bitcoin::block::Header`.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum AnyHeader {
+     V1(HeaderV1),
+-    V2(HeaderV2),
++    V2(Box<HeaderV2>),
++}
++
++impl From<HeaderV1> for AnyHeader {
++    fn from(h: HeaderV1) -> Self {
++        AnyHeader::V1(h)
++    }
++}
++
++impl From<HeaderV2> for AnyHeader {
++    fn from(h: HeaderV2) -> Self {
++        AnyHeader::V2(Box::new(h))
++    }
+ }
+ 
+ impl AnyHeader {
++    /// Parse one header from the front of `bytes`, using the version field to
++    /// decide how many bytes that is. Trailing bytes are ignored.
++    ///
++    /// This matches Bitcoin Knots exactly: `CBlockHeader`'s `SERIALIZE_METHODS`
++    /// branches on `v & VERSION_HEADER_V2_FLAG` with no activation-height gate,
++    /// so a node reading a header stream makes the same decision on the same
++    /// evidence. Where that is wrong it is wrong the same way consensus is,
++    /// which is the correct place for this code to stand.
+     pub fn parse(bytes: &[u8]) -> Result<Self> {
+         match header_size(bytes)? {
+             HEADER_V1_SIZE => {
+@@ -338,12 +418,28 @@ impl AnyHeader {
+                     "v2 header truncated: {} bytes",
+                     bytes.len()
+                 );
+-                Ok(AnyHeader::V2(HeaderV2::parse(&bytes[..HEADER_V2_SIZE])?))
++                Ok(HeaderV2::parse(&bytes[..HEADER_V2_SIZE])?.into())
+             }
+             n => bail!("impossible header size {}", n),
+         }
+     }
+ 
++    /// Parse a header of exactly `bytes.len()`, deciding by length rather than
++    /// by the version field.
++    ///
++    /// For rows read back out of our own database. There the length is
++    /// authoritative because we wrote it, and trusting it avoids depending on
++    /// bit 31 never having been set by some historical miner on a chain that
++    /// predates the flag. `parse` is for the network, where length is not known
++    /// in advance and the version field is the only signal.
++    pub fn parse_exact(bytes: &[u8]) -> Result<Self> {
++        match bytes.len() {
++            HEADER_V1_SIZE => Ok(AnyHeader::V1(deserialize(bytes)?)),
++            HEADER_V2_SIZE => Ok(HeaderV2::parse(bytes)?.into()),
++            n => bail!("not a header: {} bytes", n),
++        }
++    }
++
+     /// Walk a concatenated run of headers of mixed version.
+     ///
+     /// This is what `blockchain.block.headers` needs on the serving side and
+@@ -372,6 +468,13 @@ impl AnyHeader {
+         }
+     }
+ 
++    /// Lowercase hex of the wire encoding, which is how the Electrum protocol
++    /// carries a header.
++    pub fn serialize_hex(&self) -> String {
++        use bitcoin::hashes::hex::DisplayHex;
++        self.serialize().to_lower_hex_string()
++    }
++
+     pub fn block_hash(&self) -> BlockHash {
+         match self {
+             AnyHeader::V1(h) => h.block_hash(),
+@@ -655,6 +758,165 @@ mod tests {
+         }
+     }
+ 
++    /// The transaction walk over real blocks of both versions.
++    ///
++    /// This is the failure that would not announce itself. `bsl::Block::visit`
++    /// reads the transaction count from offset 80 unconditionally, so on a
++    /// 164-byte header it takes four bytes of `m_extranonce` as the count and
++    /// parses transactions out of the middle of the header. That does not
++    /// necessarily error; it can just index the wrong things. So the assertion
++    /// that matters is the transaction *count*, checked against what the node
++    /// reported, plus every txid matching.
++    #[test]
++    fn walks_transactions_in_blocks_of_both_versions() {
++        use bitcoin_slices::{bsl, Visit, Visitor};
++        use core::ops::ControlFlow;
++
++        let raw = include_str!("tests/blake2b_regtest.json");
++        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
++
++        #[derive(Default)]
++        struct Count {
++            txs: Vec<String>,
++            announced: usize,
++        }
++        impl Visitor for Count {
++            fn visit_block_begin(&mut self, total: usize) {
++                self.announced = total;
++            }
++            fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
++                self.txs.push(crate::types::bsl_txid(tx).to_string());
++                ControlFlow::Continue(())
++            }
++        }
++
++        let mut saw_v1 = false;
++        let mut saw_v2_multi_tx = false;
++        for (height, entry) in doc["blocks"].as_object().unwrap() {
++            let block = bytes(&entry["raw"]);
++            let ntx = entry["ntx"].as_u64().unwrap() as usize;
++
++            let header = AnyHeader::parse(&block).unwrap();
++            assert_eq!(
++                header.block_hash().to_string(),
++                entry["hash"].as_str().unwrap(),
++                "block {} hash",
++                height
++            );
++
++            let mut v = Count::default();
++            visit_block_txs(&block, &header, &mut v)
++                .unwrap_or_else(|e| panic!("block {}: {}", height, e));
++
++            assert_eq!(v.announced, ntx, "block {} announced tx count", height);
++            assert_eq!(v.txs.len(), ntx, "block {} visited tx count", height);
++            assert!(
++                v.txs.iter().all(|t| t.len() == 64),
++                "block {} produced a malformed txid, so the walk was misaligned",
++                height
++            );
++
++            if header.is_v2() {
++                if ntx > 1 {
++                    saw_v2_multi_tx = true;
++                }
++            } else {
++                saw_v1 = true;
++                // On a v1 block our walker must agree with the upstream one,
++                // byte for byte, since that path is unchanged in production.
++                let mut u = Count::default();
++                bsl::Block::visit(&block, &mut u).unwrap();
++                assert_eq!(u.txs, v.txs, "block {} diverges from bsl::Block", height);
++            }
++        }
++        assert!(saw_v1, "fixture needs a v1 block");
++        assert!(
++            saw_v2_multi_tx,
++            "fixture needs a v2 block with more than just a coinbase, \
++             or the walk is only proven on the trivial case"
++        );
++    }
++
++    /// The specific silent corruption this design avoids: handing a v2 block to
++    /// the upstream fixed-80-byte walker.
++    ///
++    /// Recorded as a test because "it would have errored anyway" is the natural
++    /// assumption and it is not true. On this fixture, offset 80 lands in
++    /// `m_nonce2`, whose first byte is zero, so `bsl::Block::visit` reads a
++    /// transaction count of 0, returns `Ok`, and visits nothing. A block with
++    /// four transactions indexes as empty, with no error anywhere. The real
++    /// count varint is at offset 164 and reads 4.
++    ///
++    /// That byte is miner-controlled, so the exact damage varies: zero means
++    /// silently dropping the block's transactions, a large value means a parse
++    /// error, and something in between means indexing garbage as transactions.
++    /// The assertion below is therefore only that upstream does not accidentally
++    /// get it right.
++    #[test]
++    fn upstream_walker_mishandles_a_v2_block() {
++        use bitcoin_slices::{bsl, Visit, Visitor};
++        use core::ops::ControlFlow;
++
++        struct Count(usize);
++        impl Visitor for Count {
++            fn visit_transaction(&mut self, _tx: &bsl::Transaction) -> ControlFlow<()> {
++                self.0 += 1;
++                ControlFlow::Continue(())
++            }
++        }
++
++        let doc: serde_json::Value =
++            serde_json::from_str(include_str!("tests/blake2b_regtest.json")).unwrap();
++        let entry = &doc["blocks"]["131"];
++        let block = bytes(&entry["raw"]);
++        let real_ntx = entry["ntx"].as_u64().unwrap() as usize;
++        assert!(real_ntx > 1);
++
++        let mut c = Count(0);
++        let upstream = bsl::Block::visit(&block, &mut c);
++        // Either it errors, or it "succeeds" with the wrong transactions. What
++        // it must not do is quietly agree with the truth.
++        let agreed = upstream.is_ok() && c.0 == real_ntx;
++        assert!(
++            !agreed,
++            "bsl::Block::visit accepted a v2 block and found the right {} transactions, \
++             which would mean this whole replacement is unnecessary",
++            real_ntx
++        );
++        // And specifically, on this fixture, it fails by succeeding.
++        assert!(
++            upstream.is_ok() && c.0 == 0,
++            "expected the silent case: Ok with zero transactions, got ok={} txs={}",
++            upstream.is_ok(),
++            c.0
++        );
++    }
++
++    /// The v2 payload must stay boxed.
++    ///
++    /// `Chain` holds one `AnyHeader` per block for the whole chain, so this
++    /// type's size is multiplied by the height: at 900k blocks, every extra 8
++    /// bytes is another 7 MB of resident memory on a box that is often also
++    /// running two Bitcoin nodes. Inlining the 164-byte v2 payload would take
++    /// the enum from 88 bytes to 168 and cost about 80 MB on a chain where every
++    /// header is v1 anyway.
++    #[test]
++    fn v2_payload_stays_boxed() {
++        use std::mem::size_of;
++        // No padding: every field aligns to 4 or less and 164 is a multiple of 4.
++        assert_eq!(
++            size_of::<HeaderV2>(),
++            HEADER_V2_SIZE,
++            "unexpected HeaderV2 layout"
++        );
++        assert!(
++            size_of::<AnyHeader>() <= size_of::<HeaderV1>() + 8,
++            "AnyHeader grew to {} bytes, larger than a v1 header plus a discriminant. \
++             Did the Box around HeaderV2 get removed?",
++            size_of::<AnyHeader>()
++        );
++    }
++
+     #[test]
+     fn rejects_a_truncated_run() {
+         let v2 = bytes(&vectors()[0]["serialized"]);
+diff --git a/src/index.rs b/src/index.rs
+index efbe377..652de9a 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -1,8 +1,8 @@
+ use anyhow::{Context, Result};
+-use bitcoin::consensus::{deserialize, Decodable, Encodable};
++use bitcoin::consensus::{deserialize, Encodable};
+ use bitcoin::hashes::Hash;
+ use bitcoin::{BlockHash, OutPoint, Txid};
+-use bitcoin_slices::{bsl, Visit, Visitor};
++use bitcoin_slices::{bsl, Visitor};
+ use std::ops::ControlFlow;
+ use std::thread;
+ 
+@@ -10,6 +10,7 @@ use crate::{
+     chain::{Chain, NewHeader},
+     daemon::Daemon,
+     db::{DBStore, WriteBatch},
++    headerv2::{visit_block_txs, AnyHeader},
+     metrics::{self, Gauge, Histogram, Metrics},
+     signals::ExitFlag,
+     types::{
+@@ -54,11 +55,19 @@ impl Stats {
+         self.update_size.observe(label, (rows.len() * N) as f64);
+     }
+ 
++    /// Same, for rows that are not fixed width. Header rows stopped being so
++    /// when v2 arrived, and summing the actual lengths is what the fixed-width
++    /// version was approximating anyway.
++    fn observe_size_var(&self, label: &str, rows: &[Vec<u8>]) {
++        let bytes: usize = rows.iter().map(Vec::len).sum();
++        self.update_size.observe(label, bytes as f64);
++    }
++
+     fn observe_batch(&self, batch: &WriteBatch) {
+         self.observe_size("write_funding_rows", &batch.funding_rows);
+         self.observe_size("write_spending_rows", &batch.spending_rows);
+         self.observe_size("write_txid_rows", &batch.txid_rows);
+-        self.observe_size("write_header_rows", &batch.header_rows);
++        self.observe_size_var("write_header_rows", &batch.header_rows);
+         debug!(
+             "writing {} funding and {} spending rows from {} transactions, {} blocks",
+             batch.funding_rows.len(),
+@@ -104,7 +113,7 @@ impl Index {
+             let tip = deserialize(&row).expect("invalid tip");
+             let headers = store
+                 .iter_headers()
+-                .map(|row| HeaderRow::from_db_row(row).header);
++                .map(|row| HeaderRow::from_db_row(&row).header);
+             chain.load(headers, tip);
+             chain.drop_last_headers(reindex_last_blocks);
+         };
+@@ -303,18 +312,21 @@ fn index_single_block(
+             ControlFlow::Continue(())
+         }
+ 
+-        fn visit_block_header(&mut self, header: &bsl::BlockHeader) -> ControlFlow<()> {
+-            let header = bitcoin::block::Header::consensus_decode(&mut header.as_ref())
+-                .expect("block header was already validated");
+-            self.batch
+-                .header_rows
+-                .push(HeaderRow::new(header).to_db_row());
+-            ControlFlow::Continue(())
+-        }
++        // No `visit_block_header`. `bitcoin_slices`' visitor hands back a
++        // `bsl::BlockHeader`, which is a fixed 80-byte view and cannot represent
++        // a v2 header. The header is parsed directly below instead, which also
++        // removes the round trip through `consensus_decode` this used to do.
+     }
+ 
++    // The header must be read before the transactions, because its length
++    // determines where the transactions start.
++    let header = AnyHeader::parse(&block).expect("core returned an unparseable block header");
++    batch
++        .header_rows
++        .push(HeaderRow::new(header.clone()).to_db_row());
++
+     let mut index_block = IndexBlockVisitor { batch, height };
+-    bsl::Block::visit(&block, &mut index_block).expect("core returned invalid block");
++    visit_block_txs(&block, &header, &mut index_block).expect("core returned invalid block");
+ 
+     let len = block_hash
+         .consensus_encode(&mut (&mut batch.tip_row as &mut [u8]))
+diff --git a/src/p2p.rs b/src/p2p.rs
+index 0787f36..edf16bc 100644
+--- a/src/p2p.rs
++++ b/src/p2p.rs
+@@ -1,5 +1,4 @@
+ use anyhow::{Context, Result};
+-use bitcoin::blockdata::block::Header as BlockHeader;
+ use bitcoin::consensus::Encodable;
+ use bitcoin::{
+     consensus::{
+@@ -15,9 +14,8 @@ use bitcoin::{
+         message_network, Magic,
+     },
+     secp256k1::{self, rand::Rng},
+-    Block, BlockHash,
++    BlockHash,
+ };
+-use bitcoin_slices::{bsl, Parse};
+ use crossbeam_channel::{bounded, select, Receiver, Sender};
+ 
+ use std::io::Write;
+@@ -28,6 +26,7 @@ use crate::types::SerBlock;
+ use crate::{
+     chain::{Chain, NewHeader},
+     config::ELECTRS_VERSION,
++    headerv2::AnyHeader,
+     metrics::{default_duration_buckets, default_size_buckets, Histogram, Metrics},
+ };
+ 
+@@ -57,7 +56,7 @@ impl Request {
+ pub(crate) struct Connection {
+     req_send: Sender<Request>,
+     blocks_recv: Receiver<SerBlock>,
+-    headers_recv: Receiver<Vec<BlockHeader>>,
++    headers_recv: Receiver<Vec<AnyHeader>>,
+     new_block_recv: Receiver<()>,
+ 
+     blocks_duration: Histogram,
+@@ -77,7 +76,7 @@ impl Connection {
+         debug!("got {} new headers", headers.len());
+         let prev_blockhash = match headers.first() {
+             None => return Ok(vec![]),
+-            Some(first) => first.prev_blockhash,
++            Some(first) => first.prev_blockhash(),
+         };
+         let new_heights = match chain.get_block_height(&prev_blockhash) {
+             Some(last_height) => (last_height + 1)..,
+@@ -114,13 +113,14 @@ impl Connection {
+                         .blocks_recv
+                         .recv()
+                         .with_context(|| format!("failed to get block {}", hash))?;
+-                    let header = bsl::BlockHeader::parse(&block[..])
+-                        .expect("core returned invalid blockheader")
+-                        .parsed_owned();
+-                    ensure!(
+-                        &header.block_hash_sha2()[..] == hash.as_byte_array(),
+-                        "got unexpected block"
+-                    );
++                    // Not `bsl::BlockHeader::block_hash_sha2`: that is SHA256d
++                    // over a fixed 80-byte view, so on a v2 chain it would hash
++                    // the wrong bytes with the wrong algorithm and reject every
++                    // block. `AnyHeader` picks both by the header's own version
++                    // field.
++                    let header = AnyHeader::parse(&block)
++                        .context("peer returned an unparseable block header")?;
++                    ensure!(header.block_hash() == hash, "got unexpected block");
+                     Ok(block)
+                 })?;
+                 self.blocks_duration
+@@ -239,7 +239,7 @@ impl Connection {
+ 
+         let (req_send, req_recv) = bounded::<Request>(1);
+         let (blocks_send, blocks_recv) = bounded::<SerBlock>(10);
+-        let (headers_send, headers_recv) = bounded::<Vec<BlockHeader>>(1);
++        let (headers_send, headers_recv) = bounded::<Vec<AnyHeader>>(1);
+         let (new_block_send, new_block_recv) = bounded::<()>(0);
+         let (init_send, init_recv) = bounded::<()>(0);
+ 
+@@ -355,7 +355,21 @@ impl RawNetworkMessage {
+                 let len = VarInt::consensus_decode(&mut raw)?.0;
+                 let mut headers = Vec::with_capacity(len as usize);
+                 for _ in 0..len {
+-                    headers.push(Block::consensus_decode(&mut raw)?.header);
++                    // Each entry is a header plus a transaction count that is
++                    // always zero. Upstream decoded a whole `Block` and threw
++                    // away everything but `.header`, which fixes the header at
++                    // 80 bytes. Read the header by its own length instead, then
++                    // step over the count.
++                    let header =
++                        AnyHeader::parse(raw).context("invalid block header in headers message")?;
++                    raw = &raw[header.size()..];
++                    let txcount = VarInt::consensus_decode(&mut raw)?.0;
++                    ensure!(
++                        txcount == 0,
++                        "headers message carried a block with {} transactions",
++                        txcount
++                    );
++                    headers.push(header);
+                 }
+                 ParsedNetworkMessage::Headers(headers)
+             }
+@@ -379,7 +393,7 @@ enum ParsedNetworkMessage {
+     Verack,
+     Inv(Vec<Inventory>),
+     Ping(u64),
+-    Headers(Vec<BlockHeader>),
++    Headers(Vec<AnyHeader>),
+     Block(SerBlock),
+     Ignored,
+ }
+diff --git a/src/status.rs b/src/status.rs
+index 29b1651..58ce9d7 100644
+--- a/src/status.rs
++++ b/src/status.rs
+@@ -4,7 +4,7 @@ use bitcoin::{
+     hashes::{sha256, Hash, HashEngine},
+     Amount, BlockHash, OutPoint, SignedAmount, Transaction, Txid,
+ };
+-use bitcoin_slices::{bsl, Visit, Visitor};
++use bitcoin_slices::{bsl, Visitor};
+ use rayon::prelude::*;
+ use serde::ser::{Serialize, Serializer};
+ 
+@@ -18,6 +18,7 @@ use crate::{
+     cache::Cache,
+     chain::Chain,
+     daemon::Daemon,
++    headerv2::{visit_block_txs, AnyHeader},
+     index::Index,
+     mempool::Mempool,
+     types::{bsl_txid, ScriptHash, SerBlock, StatusHash},
+@@ -559,7 +560,11 @@ fn filter_block_txs_outputs(block: SerBlock, scripthash: ScriptHash) -> Vec<Filt
+         pos: 0,
+     };
+ 
+-    bsl::Block::visit(&block, &mut find_outputs).expect("core returned invalid block");
++    // Not `bsl::Block::visit`: it reads the transaction count from a fixed
++    // offset 80, so on a v2 block it walks the wrong bytes. See
++    // `headerv2::visit_block_txs`.
++    let header = AnyHeader::parse(&block).expect("core returned an unparseable block header");
++    visit_block_txs(&block, &header, &mut find_outputs).expect("core returned invalid block");
+ 
+     find_outputs.result
+ }
+@@ -606,7 +611,8 @@ fn filter_block_txs_inputs(
+         pos: 0,
+     };
+ 
+-    bsl::Block::visit(block, &mut find_inputs).expect("core returned invalid block");
++    let header = AnyHeader::parse(block).expect("core returned an unparseable block header");
++    visit_block_txs(block, &header, &mut find_inputs).expect("core returned invalid block");
+ 
+     find_inputs.result
+ }
+@@ -664,6 +670,55 @@ mod tests {
+         assert_eq!(result.result[0].value.to_sat(), 709503);
+     }
+ 
++    /// The scripthash scan must work on a v2 block.
++    ///
++    /// This is a regression test for a real miss. `filter_block_txs_outputs`
++    /// and `filter_block_txs_inputs` both called `bsl::Block::visit`, which
++    /// assumes an 80-byte header, and the substitution missed them because they
++    /// mention no header type at all. Nothing failed: the walker read a
++    /// transaction count of zero out of the middle of the header, found no
++    /// outputs, and `blockchain.scripthash.get_history` simply returned an empty
++    /// list for an address that had been paid. Only an end-to-end run against a
++    /// BLAKE2b node caught it.
++    ///
++    /// The fixture is a 4-transaction regtest block past the activation. See
++    /// `src/tests/blake2b_regtest.json`.
++    #[test]
++    fn finds_outputs_in_a_v2_block() {
++        use bitcoin::hashes::hex::FromHex;
++
++        let doc: serde_json::Value =
++            serde_json::from_str(include_str!("tests/blake2b_regtest.json")).unwrap();
++        let entry = &doc["blocks"]["131"];
++        let block = Vec::from_hex(entry["raw"].as_str().unwrap()).unwrap();
++        let ntx = entry["ntx"].as_u64().unwrap();
++        assert!(ntx > 1, "fixture must have more than a coinbase");
++
++        // A P2PKH output paid by the block's second transaction (pos 1). The
++        // txid below reconstructs this block's own merkle root together with
++        // the other three, so it is the node's view, not ours.
++        let spk =
++            bitcoin::ScriptBuf::from_hex("76a91425d32234e3ab976bd1c81f735dbc2d930c25585288ac")
++                .unwrap();
++        let scripthash = ScriptHash::new(&spk);
++
++        let found = super::filter_block_txs_outputs(block, scripthash);
++        assert_eq!(
++            found.len(),
++            1,
++            "expected exactly one paying transaction in the v2 block, got {}. \
++             Zero means the block walk read the wrong transaction count.",
++            found.len()
++        );
++        assert_eq!(
++            found[0].txid.to_string(),
++            "21fe0f4e6eb5971ed29134a3c76504c7ec2b1925670ba5b773be5f535a770835"
++        );
++        assert_eq!(found[0].pos, 1);
++        assert_eq!(found[0].result[0].index, 0);
++        assert_eq!(found[0].result[0].value.to_sat(), 50_000_000);
++    }
++
+     #[test]
+     fn test_find_inputs() {
+         let block = mainnet_702861().to_vec();
+diff --git a/src/tests/blake2b_regtest.json b/src/tests/blake2b_regtest.json
+new file mode 100644
+index 0000000..cc02623
+--- /dev/null
++++ b/src/tests/blake2b_regtest.json
+@@ -0,0 +1,144 @@
++{
++ "comment": "BLAKE2b regtest chain from Bitcoin Knots v29.4.1.knots20260508rc2, activation at height 20 via -testactivationheight=blake2b@20. Headers 1..24 chain from the regtest genesis and cross the v1/v2 boundary. Captured 2026-08-24 for the electrs header-v2 work.",
++ "activation_height": 20,
++ "headline": "electrs b2 capture",
++ "headers": [
++  {
++   "height": 1,
++   "hash": "67400f7c9a7d64eb1f70e5e8c5db1e059bc8f96c4332fb77431aa5299eefa6d6",
++   "header": "0000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f76a1d72a21fb215275425c7812f3351f11f39f3fd207fdeb9f4933d1ec910a7f7ee58c6affff7f2002000000"
++  },
++  {
++   "height": 2,
++   "hash": "6fe7a79e92fe9551fa7ee708c05845c060d894e5805b26a4848832f5761f0a37",
++   "header": "00000020d6a6ef9e29a51a4377fb32436cf9c89b051edbc5e8e5701feb647d9a7c0f4067f7c04eb1ee5c7202fccb2c452e2d9c16aee61e17a607a23ed544933c5362a22f7fe58c6affff7f2002000000"
++  },
++  {
++   "height": 3,
++   "hash": "5bf77fd97d448c22825429830c6a7f0e689f8f8d2cf25a11f26bc3409b92d2c9",
++   "header": "00000020370a1f76f5328884a4265b80e594d860c04558c008e77efa5195fe929ea7e76f65e3bfd72a7cf612dc772018e1b90de33208b8350377cae3e81bf78e1d1caf897fe58c6affff7f2000000000"
++  },
++  {
++   "height": 4,
++   "hash": "1239325c39b70a12d58836b08721dfc348be9449e8e9f59353fd0478ff89e9d6",
++   "header": "00000020c9d2929b40c36bf2115af22c8d8f9f680e7f6a0c83295482228c447dd97ff75bbe0c85719b08a3dcf0118ba78a5564419496e53b0c20ecb4c7f36a39770900b180e58c6affff7f2000000000"
++  },
++  {
++   "height": 5,
++   "hash": "6518fb6274d086425521cd15d5c1b0418eb7610cd50c895efd05b9f093c53937",
++   "header": "00000020d6e989ff7804fd5393f5e9e84994be48c3df2187b03688d5120ab7395c3239124e1b5f44a67055548017d3e7c635f52a3c8a8e283b6030113d1df001e6c8b98b80e58c6affff7f2002000000"
++  },
++  {
++   "height": 6,
++   "hash": "4fdc03c2a040c19df234a7c6acac2759f88a82b28867cdc1418e4d20d80ffdb0",
++   "header": "000000203739c593f0b905fd5e890cd50c61b78e41b0c1d515cd21554286d07462fb186526da7a9e172783ff2741a7461a98e90c25a9806c1b36a140feec7b3442f3e71680e58c6affff7f2002000000"
++  },
++  {
++   "height": 7,
++   "hash": "11bfedbfe2b54d72797f58022b451018b3f2b857e6891c93c1b2835691ec7fc0",
++   "header": "00000020b0fd0fd8204d8e41c1cd6788b2828af85927acacc6a734f29dc140a0c203dc4fa8b675491fcd8af482a836e5b16688468565fcc84d7242313a8d3dbc20dc0adc80e58c6affff7f2001000000"
++  },
++  {
++   "height": 8,
++   "hash": "54e9d523df4da9b394a18f492f77c2f51946b9189b5ed97d83ff1150be88f2e0",
++   "header": "00000020c07fec915683b2c1931c89e657b8f2b31810452b02587f79724db5e2bfedbf114fe9e6daacc1a9a2d53b41a2b6a5a422988141651c118f7586a751a85236becf81e58c6affff7f2000000000"
++  },
++  {
++   "height": 9,
++   "hash": "2085c49c0f68a42cdb5a9908dd7cf38b912e8c50bd2173eba18cc44c2e6ac7b3",
++   "header": "00000020e0f288be5011ff837dd95e9b18b94619f5c2772f498fa194b3a94ddf23d5e95463bbcd77c627f371dd8512f9463e1e5cb8af3fad52d087b500c141d8a96f89f481e58c6affff7f2003000000"
++  },
++  {
++   "height": 10,
++   "hash": "56a77cc13f015057417b52d700bd9f1bbf58ef1dd24bb1f7bef375a78110c08f",
++   "header": "00000020b3c76a2e4cc48ca1eb7321bd508c2e918bf37cdd08995adb2ca4680f9cc48520617938cb8a46ff13be513e235511e965641614e5ed3d51676480fc71e9d9b71e81e58c6affff7f2000000000"
++  },
++  {
++   "height": 11,
++   "hash": "0d9e49cee6d81894fc86500994cddaf9d5a191b23a321c6d898a208382ec82d4",
++   "header": "000000208fc01081a775f3bef7b14bd21def58bf1b9fbd00d7527b415750013fc17ca756d4e60e1657542a50b695cfd9a5856592bedaaa526692362882cb1c7d3f646efe81e58c6affff7f2001000000"
++  },
++  {
++   "height": 12,
++   "hash": "267a55d5e826923b39eac3af1911ca25a8f0ab5b2e9954b0a2be96bcbfd58f4d",
++   "header": "00000020d482ec8283208a896d1c323ab291a1d5f9dacd94095086fc9418d8e6ce499e0dd40abdbe74b88efa524984fe7afe6c616daf07fe7104afd1bc11a6fcc499748781e58c6affff7f2000000000"
++  },
++  {
++   "height": 13,
++   "hash": "1fb2cd305f2d0bb3cf7450a0ee0776abc51dd7c02e2e1028bb6e5b03a07292c1",
++   "header": "000000204d8fd5bfbc96bea2b054992e5babf0a825ca1119afc3ea393b9226e8d5557a267446892293e074ccb6a4774dd5731f998c06d65827f291e4b5a6ab8b1017288781e58c6affff7f2001000000"
++  },
++  {
++   "height": 14,
++   "hash": "374139404a6114a8535f72d00f880ec03087118bc5541026d918297c68e2f752",
++   "header": "00000020c19272a0035b6ebb28102e2ec0d71dc5ab7607eea05074cfb30b2d5f30cdb21f039df8175dc406e7d41d67d32d5a1fea18df14c56e19ea99a369bf6d68f9174382e58c6affff7f2002000000"
++  },
++  {
++   "height": 15,
++   "hash": "61f4794f51c86f08efd47a31812726802e9091e043390307a72dadd37bd9b1ed",
++   "header": "0000002052f7e2687c2918d9261054c58b118730c00e880fd0725f53a814614a40394137c808b39b6dcec0245b27220243c49ab2643d9d2e4af2d52dea4192313ee2ec6e82e58c6affff7f2004000000"
++  },
++  {
++   "height": 16,
++   "hash": "3d9d0332efd27aa2f02ed4f39d019aaf07d8ce418089b8fddae565f9f8f8658b",
++   "header": "00000020edb1d97bd3ad2da707033943e091902e80262781317ad4ef086fc8514f79f4614e6fbc710d5438b05bb8b266a1263ae44ddd57aeaded28d540853a73189942c882e58c6affff7f2001000000"
++  },
++  {
++   "height": 17,
++   "hash": "6082fbd2ff30c4884831d739699bb05f9bade5b96495f501f6d21a1ce3533826",
++   "header": "000000208b65f8f8f965e5dafdb8898041ced807af9a019df3d42ef0a27ad2ef32039d3d0da8e685040fe75bb98c8da6156e3b0706d389d095ca85d79b68ef380358a9f282e58c6affff7f2001000000"
++  },
++  {
++   "height": 18,
++   "hash": "55e26792a487514eae842300aa2401bc781f2086f0a0086ce5aee7ae9ccc415f",
++   "header": "00000020263853e31c1ad2f601f59564b9e5ad9b5fb09b6939d7314888c430ffd2fb8260f4c32607b6177ad4b486982898bbc86661704779b85b6d44cc9a43049a9a7c5e82e58c6affff7f2000000000"
++  },
++  {
++   "height": 19,
++   "hash": "1b95baae716690fd7c03ef9a8e48f67c2fc4aadd883e78698913bdba6e497a8d",
++   "header": "000000205f41cc9caee7aee56c08a0f086201f78bc0124aa002384ae4e5187a49267e25522a3c731ec949ef9a148d5e32e3889f86cdcb8d7a14cb03464da37e68a3280c982e58c6affff7f2000000000"
++  },
++  {
++   "height": 20,
++   "hash": "19b87eb42d465504872407735341a483bf83a372c4d21b6427cf051febc277af",
++   "header": "000000a08d7a496ebabd138969783e88ddaac42f7cf6488e9aef037cfd906671aeba951ba0586c0d42e0a91fb73596fa786676600aeeb65e45259e2329bbcfb51716bb0183e58c6affff7f2000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000140000000000000000000000000000000000000000000000000000000000000000000000"
++  },
++  {
++   "height": 21,
++   "hash": "68c7347f4f24c853879f15eac87a592f5ba54605f7f6284cafe9cc7b4d69bede",
++   "header": "000000a0af77c2eb1f05cf27641bd2c472a383bf83a44153730724870455462db47eb819b6bd8787e6b93e2bbe1c1010908f1b050a03fc39f386ba65999bf5419efeec7683e58c6affff7f2000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000150000000000000000000000000000000000000000000000000000000000000000000000"
++  },
++  {
++   "height": 22,
++   "hash": "47188b427799be90d5a9c9efc611d7a7ec7566c603ea3ab7ebd86376322a289b",
++   "header": "000000a0debe694d7bcce9af4c28f6f70546a55b2f597ac8ea159f8753c8244f7f34c768dd78f51c1eef0fe0c207571a9d12d3798c5dce0a7abf2c5322454b592c93ed3683e58c6affff7f2000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000000000000"
++  },
++  {
++   "height": 23,
++   "hash": "2b589d2ef731f365e1b2f9a74220f8b7f167dc5bd7b51dc3bc5589db832c9127",
++   "header": "000000a09b282a327663d8ebb73aea03c66675eca7d711c6efc9a9d590be9977428b1847d097a28855403b7804f5c1c7d9f5311faa076d68c9873a31d5ffb8f279b3103a83e58c6affff7f2000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000000000000"
++  },
++  {
++   "height": 24,
++   "hash": "3a569dbd37a70840cbc84dfea86e7a1d6c7403aa772c69ba54d295aeafa6cbfa",
++   "header": "000000a027912c83db8955bcc31db5d75bdc67f1b7f82042a7f9b2e165f331f72e9d582b2a8907362db478321d904cefc9db4db1f36c28b2067e07956d6d2cd9b04cea6f83e58c6affff7f2000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000180000000000000000000000000000000000000000000000000000000000000000000000"
++  }
++ ],
++ "blocks": {
++  "19": {
++   "hash": "1b95baae716690fd7c03ef9a8e48f67c2fc4aadd883e78698913bdba6e497a8d",
++   "ntx": 1,
++   "raw": "000000205f41cc9caee7aee56c08a0f086201f78bc0124aa002384ae4e5187a49267e25522a3c731ec949ef9a148d5e32e3889f86cdcb8d7a14cb03464da37e68a3280c982e58c6affff7f200000000001020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff03011300ffffffff0200f2052a010000001976a9148aef5cfe3512a3bae79e25b89a9d81fbcaab69d188ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000"
++  },
++  "20": {
++   "hash": "19b87eb42d465504872407735341a483bf83a372c4d21b6427cf051febc277af",
++   "ntx": 1,
++   "raw": "000000a08d7a496ebabd138969783e88ddaac42f7cf6488e9aef037cfd906671aeba951ba0586c0d42e0a91fb73596fa786676600aeeb65e45259e2329bbcfb51716bb0183e58c6affff7f200000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000001020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff1601140012656c65637472732062322063617074757265ffffffff0200f2052a010000001976a9148aef5cfe3512a3bae79e25b89a9d81fbcaab69d188ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000"
++  },
++  "131": {
++   "hash": "1bd2066b6deb46c2b03db13b37f18cb8b0e5950e4d6598c7f0bda41faab04305",
++   "ntx": 4,
++   "raw": "000000a038ce8ec32d5a7f7d3a496c42cc50c1e6d1380594b7dfac36c5507dfa5860657877d0b60a5def05db01d6265cded693bc767fb294f04f98061ca86cadb3316f0f97e58c6affff7f200100000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000083000000000000000000000000000000000000000000000000000000000000000000000004020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0402830000ffffffff025e0c062a010000001976a914d9706efc043a7bed2f28d0892f10e2896011f86988ac0000000000000000266a24aa21a9edea060313bc12fbd36dca61db88e524f467ece0f18d9bb59faac6b9c7c60a560601200000000000000000000000000000000000000000000000000000000000000000000000000200000001f7c04eb1ee5c7202fccb2c452e2d9c16aee61e17a607a23ed544933c5362a22f000000006a47304402203cdb05d0f6b3770a6f085bb7535a28b2a38952dcb4808b0806d52f01d5fc00e602205261a77d4e920f12c62cb091cfcf4b9145f856d9c21ac220f5a256313a7b8c4f212102f2d3140791a262cf9b693afe55a3ca17dbf49ab391368473535b10ecb2da284ffdffffff0280f0fa02000000001976a91425d32234e3ab976bd1c81f735dbc2d930c25585288acb6f80a27010000001976a914302827a8fe3ae0b35804c7b862cc1dba037eda2288ac8200000002000000017c7a631d76f347b8eb5e618b5a384bb2d7acdc45884f0cf6a9dcca70e86f7a10000000006a47304402201cdbdd3f09a3cd6a3d6327a7ebbb01aeaf3f1030df0483ea8932f9376b04d41e02203c18daf23620d665dd51328c309f95ca674c408610e571c57339d8f0a804912d2121026e1e87eb5629622e3d1714dbbac034615196ab2d4b62300ffc32abf2e9336da6fdffffff02b6f80a27010000001976a91425f20e1fbf3d5504ea0987df576a82399fbda11f88ac80f0fa02000000001976a91477e13479b539d0139d2879172502d35d64a8ac2e88ac82000000020000000120d625cddb50f3fc139f29cbf8a4f8ce63112c303fe1f442013d20591ba216db000000006a473044022066a6bb64b354e8b52459ec3286c51d8697dd33fc7c3b61e14d14b5db747cc5f20220037c1b58c98157c94ebc1a4e0890b643fb68f58a2c54dae50ae4d2ccc10acc012121026e1e87eb5629622e3d1714dbbac034615196ab2d4b62300ffc32abf2e9336da6fdffffff02b6f80a27010000001976a9145a10891b36b437642702adb104285702c372388088ac80f0fa02000000001976a91407c5588760c4dc58c53f7b47245c5f2b5bfd53ff88ac82000000"
++  }
++ }
++}
+diff --git a/src/tracker.rs b/src/tracker.rs
+index 2abcf9d..61530bd 100644
+--- a/src/tracker.rs
++++ b/src/tracker.rs
+@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
+ 
+ use anyhow::{Context, Result};
+ use bitcoin::{BlockHash, Txid};
+-use bitcoin_slices::{bsl, Error::VisitBreak, Visit, Visitor};
++use bitcoin_slices::{bsl, Visitor};
+ 
+ use crate::{
+     cache::Cache,
+@@ -10,6 +10,7 @@ use crate::{
+     config::Config,
+     daemon::Daemon,
+     db::DBStore,
++    headerv2::{visit_block_txs, AnyHeader},
+     index::Index,
+     mempool::{FeeHistogram, Mempool},
+     metrics::Metrics,
+@@ -115,9 +116,14 @@ impl Tracker {
+                 return; // keep first matching transaction
+             }
+             let mut visitor = FindTransaction::new(txid);
+-            result = match bsl::Block::visit(&block, &mut visitor) {
+-                Ok(_) | Err(VisitBreak) => visitor.found.map(|tx| (blockhash, tx)),
+-                Err(e) => panic!("core returned invalid block: {:?}", e),
++            // Not `bsl::Block::visit`, which assumes an 80-byte header.
++            let header =
++                AnyHeader::parse(&block).expect("core returned an unparseable block header");
++            result = match visit_block_txs(&block, &header, &mut visitor) {
++                // `visit_block_txs` surfaces a visitor break as an error, and a
++                // break is how FindTransaction reports success, so both arms
++                // just ask the visitor what it found.
++                Ok(()) | Err(_) => visitor.found.map(|tx| (blockhash, tx)),
+             };
+         })?;
+         Ok(result)
+diff --git a/src/types.rs b/src/types.rs
+index 9bd4be6..f31284f 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -2,7 +2,6 @@ use anyhow::Result;
+ 
+ use std::convert::TryFrom;
+ 
+-use bitcoin::blockdata::block::Header as BlockHeader;
+ use bitcoin::{
+     consensus::encode::{deserialize, Decodable, Encodable},
+     hashes::{hash_newtype, sha256, Hash},
+@@ -10,6 +9,8 @@ use bitcoin::{
+ };
+ use bitcoin_slices::bsl;
+ 
++use crate::headerv2::AnyHeader;
++
+ macro_rules! impl_consensus_encoding {
+     ($thing:ident, $($field:ident),+) => (
+         impl Encodable for $thing {
+@@ -163,33 +164,38 @@ impl TxidRow {
+ 
+ // ***************************************************************************
+ 
+-pub(crate) type SerializedHeaderRow = [u8; HEADER_ROW_SIZE];
++/// A header row on its way to or from the `headers` column family.
++///
++/// Variable length, because a v2 header is 164 bytes and a v1 header is 80. It
++/// used to be `[u8; 80]`. Header rows are stored as *keys* with an empty value,
++/// and RocksDB keys are already arbitrary byte strings, so the storage format
++/// needed no change beyond letting the length vary.
++pub(crate) type SerializedHeaderRow = Vec<u8>;
+ 
+-#[derive(Debug, Serialize, Deserialize)]
++#[derive(Debug)]
+ pub(crate) struct HeaderRow {
+-    pub(crate) header: BlockHeader,
++    pub(crate) header: AnyHeader,
+ }
+ 
+-pub const HEADER_ROW_SIZE: usize = 80;
+-
+-impl_consensus_encoding!(HeaderRow, header);
+-
+ impl HeaderRow {
+-    pub(crate) fn new(header: BlockHeader) -> Self {
++    pub(crate) fn new(header: AnyHeader) -> Self {
+         Self { header }
+     }
+ 
+     pub(crate) fn to_db_row(&self) -> SerializedHeaderRow {
+-        let mut row = [0; HEADER_ROW_SIZE];
+-        let len = self
+-            .consensus_encode(&mut (&mut row as &mut [u8]))
+-            .expect("in-memory writers don't error");
+-        debug_assert_eq!(len, HEADER_ROW_SIZE);
+-        row
++        self.header.serialize()
+     }
+ 
+-    pub(crate) fn from_db_row(row: SerializedHeaderRow) -> Self {
+-        deserialize(&row).expect("bad HeaderRow")
++    /// Decode a row read back from our own database.
++    ///
++    /// Uses `parse_exact`, so the row's length decides the version rather than
++    /// bit 31 of its version field. We wrote the row, so its length is
++    /// authoritative, and this keeps stored data readable even if a header on
++    /// some chain happens to carry a version with the top bit set.
++    pub(crate) fn from_db_row(row: &[u8]) -> Self {
++        Self {
++            header: AnyHeader::parse_exact(row).expect("bad HeaderRow"),
++        }
+     }
+ }
+ 
+-- 
+2.43.0
+
