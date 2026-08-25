@@ -426,17 +426,27 @@ Measured over loopback, 100 sequential pruned-block fetches:
 | before | 23.7 | 42.03 ms | 43.08 ms |
 | after | **1692.0** | **0.58 ms** | 0.68 ms |
 
-**Correction to the first pass of this document**, which called the saving "a flat ~40 ms per
-block". It is not flat. Because *every* write in the encode path can stall, the penalty compounds
-with message size. Measured against real mainnet peers (§7a):
+**Correction, twice over.** The first pass of this document called the saving "a flat ~40 ms per
+block", and the second called it size-dependent. Both were wrong, and the second was wrong in a way
+worth recording.
+
+`TCP_NODELAY` changes only what the *proxy writes*, and the proxy writes one `getdata` per fetch:
+24-byte header, a varint, and a 36-byte inventory entry, so 61 bytes, whatever the block turns out
+to weigh. The block travels the other way. So no measurement showing latency scaling with block size
+can be attributed to this option, and the mainnet table below cannot mean what it was read to mean.
+Raised by the maintainer on the upstream PR and correct.
+
+What stands is the loopback measurement, where the option was the only variable, the peer and blocks
+were identical, and the effect is unambiguous. The mainnet A/B was run against different peers at
+different times and controls for neither, so it is reported here as an uncontrolled observation:
 
 | height | block size | with `TCP_NODELAY` | without |
 |---|---|---|---|
 | 200000 | 0.25 MB | 152.6 ms | 342.8 ms |
 | 900000 | 1.92 MB | 172.7 ms | **931.7 ms** |
 
-So **3.4× at the median and 5.4× on present-day blocks, widening as blocks grow** — not a fixed
-delay that matters only for nearby peers.
+The gap is real and the direction is right. The size scaling in the right-hand column is peer
+variance, not Nagle.
 
 ### Other limits (not fixed)
 

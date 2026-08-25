@@ -103,11 +103,17 @@ Real mainnet peers, clearnet, replicating the proxy's fetch path exactly:
 
 | | median per block | full chain (900k, sequential) |
 |---|---|---|
-| with `TCP_NODELAY` (proxy patch 0003) | **162 ms** | 40.5 h |
-| without (upstream proxy) | 544 ms | 136 h |
+| patched proxy | **162 ms** | 40.5 h |
+| upstream proxy | 544 ms | 136 h |
 
 Latency is flat in block size (0.25 MB and 1.92 MB cost the same within 13%) — the fetch is
 round-trip-bound.
+
+These two runs were against different peers at different times and control for neither, so the gap
+should not be attributed to any single patch. `TCP_NODELAY` in particular cannot explain it:
+it changes only what the proxy writes, which is one 61-byte `getdata` per fetch whatever the block
+weighs. Its effect is established on loopback, where it was the only variable: 23.7 to 1692
+blocks/s.
 
 Concurrency (work queue, 12 peers) reaches 9.7–13.2 blocks/s — about **2×** a good single peer, not
 the near-linear gain the flat latency suggested, because the aggregate becomes bandwidth-bound.
@@ -134,7 +140,7 @@ Full numbers in [spikes/mainnet-fetch/RESULTS.md](spikes/mainnet-fetch/RESULTS.m
 | [patches/sparrow/](patches/sparrow/) | `sparrowwallet/sparrow` + `drongo` | the client half: read the header length, hash a v2 header with BLAKE2b, negotiate 1.8 |
 | [spikes/proxy-regtest/0001](spikes/proxy-regtest/) | `Start9Labs/btc-rpc-proxy` @ `1e9a625` | configurable p2p network (was mainnet-only) |
 | [spikes/proxy-regtest/0002](spikes/proxy-regtest/) | ″ | request `MSG_WITNESS_BLOCK` — fetched blocks were witness-stripped |
-| [spikes/proxy-regtest/0003](spikes/proxy-regtest/) | ″ | set `TCP_NODELAY` — removes a ~40 ms stall per fetch (71× on loopback) |
+| [spikes/proxy-regtest/0003](spikes/proxy-regtest/) | ″ | set `TCP_NODELAY` — 23.7 to 1692 blocks/s on loopback |
 
 Proxy patches 0002 and 0003 are live defects on every pruned StartOS node, independent of this
 project. All three are submitted upstream as

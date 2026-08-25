@@ -30,7 +30,9 @@ Same, with `--no-nodelay` (upstream proxy behaviour):
 | 800000 | 1.63 MB | 726.0 ms |
 | 900000 | 1.92 MB | 931.7 ms |
 
-Median 544 ms/block, and latency tracks size => the Nagle penalty compounds.
+Median 544 ms/block. Latency tracks size here, but that is not the Nagle penalty: TCP_NODELAY
+changes only the proxy's own write, a fixed 61-byte getdata. This run and the patched one used
+different peers at different times, so the difference between them is uncontrolled.
 
 ## Concurrency scaling — `concurrency_bench.py`
 
