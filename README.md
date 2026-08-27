@@ -1,4 +1,4 @@
-# pruned-electrs
+# electrs-pruned
 
 Making [`romanz/electrs`](https://github.com/romanz/electrs) serve a normal Electrum interface from
 a **pruned** Bitcoin Core or Bitcoin Knots node, packaged for StartOS 0.4.0.x.
@@ -13,13 +13,21 @@ testnet4 from height 149537. Both changes are consensus, so on that chain electr
 parse, hash or serve a single header. Supporting it is the point at which running two nodes side by
 side, one pruned, becomes worth the trouble — which is what the pruning track is for.
 
-**Status: electrs serves the live BLAKE2b testnet4.** It indexed all 170,086 blocks, crossed the
-activation at 149537, and follows new blocks as they arrive. Its tip matches `mempool.guide`, headers
-across the activation are byte-identical to the explorer's, transactions in a v2 block match, and
-merkle proofs recompute. The pruning track is complete and proven on regtest. The Electrum protocol
-surface (the [1.8 proposal](docs/electrum-header-v2.md)) is implemented on both sides: electrs serves it,
-and a patched Sparrow follows the chain across the activation. Upstream adoption is the piece that
-still needs other people.
+**Status: the whole wallet stack runs on the live BLAKE2b testnet4.** electrs indexed all 170,086
+blocks, crossed the activation at 149537, and follows new blocks as they arrive; headers across the
+activation, transactions in a v2 block and recomputed merkle proofs all matched
+`mempool.guide/testnet4` when that was checked on 2026-08-24. The pruning track is complete and
+proven on regtest. The Electrum protocol surface (the [1.8 proposal](docs/electrum-header-v2.md)) is
+implemented on both sides: electrs serves it, and a patched Sparrow follows the chain across the
+activation, **now verified against the live chain rather than only regtest** (see below). Upstream
+adoption is the piece that still needs other people.
+
+**`mempool.guide/testnet4` is no longer a usable oracle for this chain.** As of 2026-08-27 it
+reports tip 150029 and a different block at height 149537
+(`0000000000871854…`, against the fork's `000000000068f604…`), which is ordinary testnet4 rather
+than the BLAKE2b chain. The comparisons above stand as of the date they were taken; anything new
+should be checked against a node, or against the header hashes recorded in
+[spikes/blake2b-testnet4/](spikes/blake2b-testnet4/).
 
 ## Documents
 
@@ -44,8 +52,9 @@ advances 400 blocks and prunes past it — repairs fully, so **no lifecycle coor
 reorg, interrupted indexing, block source unavailable during indexing (retries, then completes
 without a restart), and proxy outage during queries (prompt error, no freeze).
 
-One known functional gap: **`transaction.get` with `verbose=true`** fails on pruned blocks — its
-second leg is `getrawtransaction`, which the proxy does not intercept.
+The last known functional gap, **`transaction.get` with `verbose=true`** on a pruned block, is
+closed: btc-rpc-proxy now intercepts `getrawtransaction` when a blockhash is supplied, which is the
+form electrs sends. Needs a proxy carrying that change.
 
 ## BLAKE2b header v2
 
@@ -152,7 +161,7 @@ project. All three are submitted upstream as
 DISCOVERY.md  ARCHITECTURE.md
 patches/      electrs patch set (the deliverable)
 packaging/
-  pruned-electrs-startos/   the StartOS package, forked from electrs-startos
+  electrs-pruned-startos/   the StartOS package, forked from electrs-startos
 spikes/
   p2p-pruned/     single-node probes: what bitcoind does with a pruned getdata
   proxy-regtest/  btc-rpc-proxy patches
