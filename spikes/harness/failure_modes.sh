@@ -6,8 +6,11 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ELECTRS=/mnt/Black/pruned-electrs/vendor/electrs/target/release/electrs
-PROXY=/mnt/Black/pruned-electrs/vendor/btc-rpc-proxy/target/release/btc_rpc_proxy
+# Derived from this script's own location rather than written out, so the tree
+# can be moved or the repo renamed without editing paths here.
+REPO="$(cd "$ROOT/../.." && pwd)"
+ELECTRS="${ELECTRS:-$REPO/vendor/electrs/target/release/electrs}"
+PROXY="${PROXY:-$REPO/vendor/btc-rpc-proxy/target/release/btc_rpc_proxy}"
 CLI="$HOME/bin/knots/bin/bitcoin-cli"
 acli() { "$CLI" -datadir="$ROOT/nodeA" -conf="$ROOT/nodeA/bitcoin.conf" "$@"; }
 bcli() { "$CLI" -datadir="$ROOT/nodeB" -conf="$ROOT/nodeB/bitcoin.conf" "$@"; }

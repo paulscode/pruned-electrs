@@ -1,0 +1,33 @@
+{
+  "bitcoind": {
+    "rpccookiefile": "HARNESS/nodeB/regtest/.cookie",
+    "rpcurl": "http://127.0.0.1:19013",
+    "work_update_seconds": 40,
+    "notify_fallback": true
+  },
+  "stratum": {
+    "listen_addr": "127.0.0.1",
+    "listen_port": 23334,
+    "vardiff_min": 1,
+    "idle_timeout_no_shares": 0,
+    "share_stale_seconds": 150
+  },
+  "mining": {
+    "pool_address": "bc1qug9gpr6xl4mz3yyfumsx29guhndt7admj9yhhr",
+    "coinbase_tag_primary": "pruned node test",
+    "coinbase_tag_secondary": "B",
+    "save_submitblocks_dir": "./submitted"
+  },
+  "api": {
+    "listen_addr": "127.0.0.1",
+    "listen_port": 7152
+  },
+  "logger": {
+    "log_to_console": true,
+    "log_level_console": 1
+  },
+  "datum": {
+    "pool_host": "",
+    "pooled_mining_only": false
+  }
+}

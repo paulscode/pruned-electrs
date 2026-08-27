@@ -75,7 +75,7 @@ def netaddr():
 
 
 def version_payload():
-    ua = b"/pruned-electrs-bench:0.1/"
+    ua = b"/electrs-pruned-bench:0.1/"
     return (
         struct.pack("<i", PROTOCOL_VERSION)
         + struct.pack("<Q", 0)

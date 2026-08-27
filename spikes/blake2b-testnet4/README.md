@@ -158,3 +158,25 @@ negligible (a handful of testers, and these are already publicly reachable), but
 the list is deliberately short rather than all 18, and it is not a substitute for
 re-running the tool. If any operator objects, dropping an entry is a one-line
 change.
+
+## Fetching headers from the fork
+
+`fetch_fork_headers.py` takes a block hash and pulls the headers following it off
+one of the confirmed peers, over p2p rather than from an explorer. It exists to
+feed a client's verification with data nobody chose:
+
+```bash
+./fetch_fork_headers.py "$(curl -s https://mempool.guide/testnet4/api/block-height/149183)" --limit 600
+```
+
+That anchor is deliberate. 149183 is the last checkpoint Sparrow ships for
+testnet4, being 74 retarget periods, and it is 354 blocks below the activation on
+history the two chains share, so a run starting there spans the fork with the
+real difficulty targets and the real timestamps either side of it.
+
+Asking a *fork* peer specifically is the point. An ordinary testnet4 peer answers
+the same request with the other chain, and the two agree up to 149536.
+
+`fork-headers.json` is output, not a source file: the script rewrites it, and
+`Blake2bLiveHeadersHarness` in the Sparrow patches reads it. What that harness
+found is in `patches/sparrow/README.md`.

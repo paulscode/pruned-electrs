@@ -19,3 +19,9 @@ packaging/
 
 # Internal planning docs — not published
 internal_docs/
+
+# datum-pruned spike: built binary and per-run state
+spikes/datum-pruned/miner
+spikes/datum-pruned/conf.json
+spikes/datum-pruned/datum.log
+spikes/datum-pruned/submitted/

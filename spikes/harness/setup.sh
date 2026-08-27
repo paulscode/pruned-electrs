@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regtest harness for pruned-electrs.
+# Regtest harness for electrs-pruned.
 #
 # Topology — the smallest thing that can reproduce a StartOS pruned node:
 #
@@ -15,14 +15,15 @@
 # outbound direction the proxy sees no eligible peers and every pruned fetch
 # fails.
 #
-# Requires the network-magic patch from spikes/proxy-regtest applied to the
-# proxy: upstream hardcodes mainnet magic and cannot speak regtest at all.
+# Needs btc-rpc-proxy v0.7.0 or later. Before v0.6.0 it hardcoded mainnet magic
+# and could not speak regtest at all; v0.6.0 took the magic from a `network`
+# option, and v0.7.0 derives it from bitcoind, so this config sets neither.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BITCOIND="${BITCOIND:-$HOME/bin/knots/bin/bitcoind}"
 BITCOIN_CLI="${BITCOIN_CLI:-$HOME/bin/knots/bin/bitcoin-cli}"
-PROXY="${PROXY:-/mnt/Black/pruned-electrs/vendor/btc-rpc-proxy/target/release/btc_rpc_proxy}"
+PROXY="${PROXY:-$(cd "$ROOT/../.." && pwd)/vendor/btc-rpc-proxy/target/release/btc_rpc_proxy}"
 
 A_DIR="$ROOT/nodeA"; A_RPC=19001; A_P2P=19000
 B_DIR="$ROOT/nodeB"; B_RPC=19011; B_P2P=19010; B_WHITE=19012
@@ -84,7 +85,6 @@ bitcoind_port = $B_RPC
 bind_address = "127.0.0.1"
 bind_port = $PROXY_PORT
 cookie_file = "$B_DIR/regtest/.cookie"
-network = "regtest"
 default_fetch_blocks = true
 max_peer_concurrency = 3
 passthrough_rpccookie = "$B_DIR/regtest/.cookie"
@@ -124,15 +124,24 @@ stop_all() {
 case "${1:-up}" in
   up)
     write_confs; start_nodes
-    ADDR=$(acli -named createwallet wallet_name=w >/dev/null 2>&1; acli getnewaddress)
-    echo "mining 800 blocks on A…"
-    acli generatetoaddress 800 "$ADDR" > /dev/null
+    # Idempotent: `up` on an existing datadir has a wallet already, which
+    # createwallet refuses and loadwallet handles, and has blocks already, which
+    # only need topping up to 800.
+    acli -named createwallet wallet_name=w >/dev/null 2>&1 \
+      || acli loadwallet w >/dev/null 2>&1 || true
+    ADDR=$(acli getnewaddress)
+    HAVE=$(acli getblockcount)
+    if [ "$HAVE" -lt 800 ]; then
+      echo "mining $((800 - HAVE)) blocks on A…"
+      acli generatetoaddress "$((800 - HAVE))" "$ADDR" > /dev/null
+    fi
     echo "waiting for B to sync…"
     for i in $(seq 60); do
       [ "$(bcli getblockcount)" = "800" ] && break; sleep 1
     done
     echo "A=$(acli getblockcount) B=$(bcli getblockcount)"
-    bcli pruneblockchain 500 > /dev/null
+    # Already-pruned is not an error, so do not let it stop the run.
+    bcli pruneblockchain 500 > /dev/null 2>&1 || true
     echo "B pruneheight=$(bcli getblockchaininfo | jq -r .pruneheight)"
     start_proxy
     write_electrs_conf
