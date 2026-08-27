@@ -197,10 +197,17 @@ serving `MSG_BLOCK` did exactly that, and the proxy passed the stripped block th
 
 ## Known gaps in the recommendation
 
-1. **`blockchain.transaction.get verbose=true`** fails on pruned blocks. Its second leg is
-   `getrawtransaction`, which the proxy does not intercept. Fix by reconstructing the verbose form
-   from the raw block electrs can already fetch, or by extending the proxy. Confirmed failing, and
-   now the only known functional gap.
+1. ~~**`blockchain.transaction.get verbose=true`** fails on pruned blocks.~~ **Closed 2026-08-27**
+   by extending the proxy, which was the second of the two options recorded here. It now intercepts
+   `getrawtransaction` when a blockhash is supplied, which is the form electrs sends because it
+   finds the blockhash in its own index. Core needs no `txindex` for that form, only the block, and
+   fetching a block is what the proxy already does.
+
+   The rendering is Core's, not ours. `decoderawtransaction` returns nine fields byte-identical to
+   verbose `getrawtransaction`, including `scriptPubKey.asm`, `.desc`, `.address` and `.type`, so
+   the proxy asks Core to decode the transaction it fetched and adds the six block-dependent fields
+   from `getblockheader`. Reproducing Core's script classifier was never necessary. Verified against
+   an archival node on the regtest harness: byte-identical, field for field.
 2. **No concurrency**, which §7d shows is the difference between a 17-minute and an 84-second first
    wallet connect for a Tor-only node. The largest outstanding improvement.
 3. **Per-batch RPC overhead.** The split costs one `getblockchaininfo` plus one batched
@@ -224,7 +231,7 @@ downed proxy froze the whole server for five minutes. Indexing waits 300 s, serv
 
 **Recommendation: two repositories**, matching how `electrs-startos` already works.
 
-1. `paulscode/pruned-electrs` — the electrs fork, or better, a thin patch set over a pinned upstream
+1. `paulscode/electrs-pruned` — the electrs fork, or better, a thin patch set over a pinned upstream
    submodule.
 2. a StartOS packaging repo, consuming the above.
 

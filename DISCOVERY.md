@@ -20,10 +20,10 @@ Reference checkouts live under [vendor/](vendor/), cloned at these commits.
 |---|---|---|---|---|
 | electrs (upstream) | `romanz/electrs` | `1222d361ea444e97aadf4c029658b375bcd19060` | `master` | 25 commits ahead of `v0.11.1`; no tag newer than `v0.11.1` exists |
 | **electrs (the version StartOS ships)** | `romanz/electrs` | **`35216c6d30148be8e6763d913d437330f431fc03`** | **`v0.11.1`** | The submodule pin in `electrs-startos`. All source analysis below is against this commit. |
-| electrs StartOS package | `Start9-Community/electrs-startos` | `c974d63212064616580e8f1dc5f9598907e545f1` | `master`, latest tag `v0.11.1_20` | |
+| electrs StartOS package | `Start9-Community/electrs-startos` | `c974d63212064616580e8f1dc5f9598907e545f1` | `master`, latest tag `v0.11.1_20` | **Moving to `Start9Labs/electrs-startos`**: the community repo's own `packageRepo` and README now point there (`763f08c6`). Both still active as of 2026-08-27 |
 | Bitcoin Core StartOS package | `Start9Labs/bitcoin-core-startos` | `51db7e317f48151a75b270dff49039b397048c80` | `31.x` (default), latest tag `v31.1_10` | Maintained branches: `28.x`, `29.x`, `30.x`, `31.x` |
 | Bitcoin Knots StartOS package | `Start9Labs/bitcoin-knots-startos` | `83db50ebc63355fa558dce4534ebe25722c627a9` | `29.x`, latest tag `v29.4_5-knots` | |
-| btc-rpc-proxy | `Start9Labs/btc-rpc-proxy` | `1e9a625a54c3737d1f47b63a4063cb03d8604068` | `master`, version `0.5.1` | |
+| btc-rpc-proxy | `Start9Labs/btc-rpc-proxy` | `55104f9` | `master`, **`v0.8.0`** | Was `1e9a625a` / `0.5.1` when this table was written. Four PRs of ours merged since: #29 (v0.6.0), #30 (v0.7.0), #31 and #32 (v0.8.0) |
 | StartOS SDK | `@start9labs/start-sdk` | — | **`2.0.9`** | Same version in all three packages above. This is the 0.4.0.x SDK. |
 
 electrs `v0.11.1` dependency versions that matter here: `bitcoin 0.32.8`, `bitcoincore-rpc 0.19.0`,
@@ -312,7 +312,7 @@ Classification per the brief. "Old raw block" means a block that may sit below `
 | `blockchain.scripthash.get_balance` | same (`Unspent::build` over synced status) | **requires old raw block** | same |
 | `blockchain.scripthash.listunspent` | same | **requires old raw block** | same |
 | `blockchain.transaction.get` (verbose=false) | `Cache` → `lookup_transaction` (**P2P**) → RPC `getrawtransaction` | **requires old raw block** | cache miss ⇒ hang |
-| `blockchain.transaction.get` (verbose=true) | `lookup_transaction` (**P2P**) for blockhash, then RPC `getrawtransaction txid true blockhash` | **requires old raw block** *and* **old raw tx via RPC** | hang; and the RPC leg is **not** proxy-intercepted (§6.2) |
+| `blockchain.transaction.get` (verbose=true) | `lookup_transaction` (**P2P**) for blockhash, then RPC `getrawtransaction txid true blockhash` | **requires old raw block** *and* **old raw tx via RPC** | hang; the RPC leg **is** now proxy-intercepted, since it carries a blockhash |
 | `blockchain.transaction.get_merkle` | `Chain` → RPC **`getblock <hash> 1`** | **requires old raw block, via RPC** | **proxy-servable** (§6.2) |
 | `blockchain.transaction.id_from_pos` | `Chain` → RPC **`getblock <hash> 1`** | **requires old raw block, via RPC** | **proxy-servable** (§6.2) |
 | *(indexing, not a client method)* | `Index::sync` → `for_blocks` (**P2P**) | **requires every historical block** | hang |
@@ -337,10 +337,13 @@ removes one of the brief's worries entirely.
 intercepts. Both would work through a pruned StartOS backend **today, unmodified** — if electrs ever
 got far enough to serve them.
 
-`transaction.get` with `verbose=true` will **not**: its second leg is `getrawtransaction`, which the
-proxy does not intercept, and which on a pruned node fails even with `txindex` for blocks whose data
-is gone. Serving it correctly requires reconstructing the verbose form from the raw block, or
-accepting a documented gap.
+`transaction.get` with `verbose=true` did **not**, until 2026-08-27: its second leg is
+`getrawtransaction`, which the proxy did not intercept, and which on a pruned node fails even with
+`txindex` for blocks whose data is gone. The proxy now intercepts it **when a blockhash is supplied**,
+which is the form electrs sends because `lookup_transaction` finds the blockhash in its own index.
+That was the "extend the proxy" option; the "reconstruct the verbose form" option turned out to be
+unnecessary, because `decoderawtransaction` renders the nine transaction-shaped fields identically
+and Core still has the header for the other six.
 
 ---
 
@@ -396,6 +399,12 @@ node today.
 another network drops the connection rather than answering. Adds a `network` config param
 (default `bitcoin`, so deployments are unaffected). This is a test-harness enabler, not a
 production bug.
+
+That param has since been removed again, in a second PR that takes the chain from bitcoind's own
+`getblockchaininfo` — a knob whose only failure mode is silent is worse than no knob. It also
+reaches two networks the param could not name: **testnet4**, which rust-bitcoin 0.29's `Network`
+enum has no variant for, and **custom signets**, whose magic is derived from the block challenge
+rather than fixed. See [spikes/proxy-regtest/README.md](spikes/proxy-regtest/README.md).
 
 **0002 — peer-fetched blocks are witness-stripped.** The fetcher asks for `Inventory::Block`
 (`MSG_BLOCK`), which makes a segwit-aware peer serve the *stripped* serialization. The proxy
@@ -787,10 +796,15 @@ well below the prune height — every one of these hangs on stock electrs:
 | `blockchain.transaction.id_from_pos` | pass |
 | `blockchain.scripthash.get_history` | pass — 800 entries, min height 1 |
 | `blockchain.scripthash.get_balance` | pass |
-| `blockchain.transaction.get` **verbose=true** | **fail** — `Block not available` |
+| `blockchain.transaction.get` **verbose=true** | **fail** at the time — `Block not available`; **pass** since 2026-08-27, see below |
 
-6/7. The one failure is exactly the case predicted in §6.2: its second leg is `getrawtransaction`,
-which the proxy does not intercept. That is now a confirmed gap rather than a suspicion.
+6/7 at the time. The one failure was exactly the case predicted in §6.2: its second leg is
+`getrawtransaction`, which the proxy did not intercept.
+
+**Now 7/7.** Re-run on 2026-08-27 against a proxy that intercepts `getrawtransaction` when a
+blockhash is supplied, the verbose call returns all fifteen fields for a transaction in a pruned
+block, and the response is byte-identical to the archival node's, field for field, including
+`scriptPubKey.address` and `.type`. Same harness, same block 100, same coinbase transaction.
 
 The `transaction.get` pass is also an independent check on proxy patch 0002 — it ran before any
 scripthash sync, so the cache was cold and the transaction came through the proxy; matching the
@@ -847,13 +861,19 @@ patch 0002), and all Phase 7 failure modes.
    network, so indexing alongside bitcoind's IBD is mandatory. How early bitcoind starts pruning,
    and what margin electrs has at realistic indexing rates, decides whether a large `prune` target
    suffices on its own.
-2. **`transaction.get verbose=true`.** Confirmed broken on pruned blocks (§9a) — its second leg is
-   `getrawtransaction`, which the proxy does not intercept. Three options: reconstruct the verbose
-   form from the raw block electrs can already fetch, extend the proxy, or document the gap. Needs
-   to know whether Sparrow actually calls it, which is a question about the wallet, not the server.
-3. **A bounded historical-block cache.** §7d makes this look more attractive than it did: repeated
-   query bursts on a Tor node re-fetch the same blocks at ~2 s each, and the proxy caches nothing.
-   Must stay bounded, or it eats the disk saving that motivates the project.
+2. ~~**`transaction.get verbose=true`.**~~ **Done 2026-08-27.** Of the three options listed here,
+   extending the proxy was the one taken: it intercepts `getrawtransaction` when a blockhash is
+   supplied, which is the form electrs sends. The "reconstruct the verbose form" option was
+   unnecessary once it became clear `decoderawtransaction` renders the transaction-shaped fields
+   identically to verbose `getrawtransaction`, so Core does the rendering and the proxy only adds
+   the six fields that depend on the block. The open question here, whether Sparrow calls it, turned
+   out not to gate anything: Mempool does, which is what made it worth doing.
+3. ~~**A bounded historical-block cache.**~~ **Done 2026-08-27**, on
+   `feat/bounded-block-cache` in the proxy. §7d was right that this mattered, and measuring it later
+   found a second reason: an Electrum server resolving a verbose transaction asks for the same block
+   twice within one request, so a block page cost two peer fetches per input rather than one. With
+   the cache that page costs nine fetches cold and none warm, against twenty either way before.
+   Bounded by `block_cache_size_mib`, 64 by default, exactly as this entry insisted.
 4. **How to implement concurrent fetching.** §7d settled *whether*: 6× over Tor, turning a 17-minute
    first-wallet-connect into ~84 s. It needs changes in two codebases — electrs issuing concurrent
    `getblock` calls, and the proxy spending `max_peer_concurrency` across *different* blocks instead
@@ -875,7 +895,7 @@ architecture, and now the top priority. Run electrs alongside a bitcoind doing I
 `prune` target, and measure the margin between electrs's indexing height and the prune frontier.
 Everything else assumes this works.
 
-**E11 — build the `.s9pk`.** Phase 8 is scaffolded (`packaging/pruned-electrs-startos`) but nothing
+**E11 — build the `.s9pk`.** Phase 8 is scaffolded (`packaging/electrs-pruned-startos`) but nothing
 has been built: it needs the `start-cli` toolchain, which is not installed here. Until it builds, the
 packaging is unverified.
 
