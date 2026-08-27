@@ -1,5 +1,5 @@
 From b5d003f7a6fbec8a376028d09e8ec77b18b52552 Mon Sep 17 00:00:00 2001
-From: pruned-electrs <paul@paulscode.com>
+From: electrs-pruned <paul@paulscode.com>
 Date: Tue, 25 Aug 2026 06:16:01 -0500
 Subject: [drongo PATCH] Read the block header length, and hash a v2 header
  with BLAKE2b

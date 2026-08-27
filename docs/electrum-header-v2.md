@@ -1,8 +1,15 @@
 # Electrum protocol: variable-length block headers
 
-Draft for discussion. Version 0.2, 2026-08-24.
+Draft for discussion. Version 0.3, 2026-08-26.
 
-Changes since 0.1: corrected against the current protocol and against what is actually
+Changes since 0.2: both halves are now implemented, in a fork of electrs and a fork of
+Sparrow, and the Status section at the end records what that cost and what it corrected.
+Three changes to the proposal came out of it: section 2 needs the version rule enforced
+where headers are served rather than only at `server.version`, section 3's support for both
+response forms is mandatory rather than a convenience, and open question 4 has a partial
+answer.
+
+Changes in 0.2: corrected against the current protocol and against what is actually
 deployed. Version 1.5 was skipped, 1.6 replaced the concatenated header blob with a list,
 and 1.7 is documented, so the proposal targets 1.8. But a survey of public servers shows
 Fulcrum is the only implementation reaching 1.6, so the concatenated form is still what
@@ -104,8 +111,22 @@ A server that knows its chain uses v2 headers should refuse to negotiate below 1
 the connection as the existing rules already require when no common version exists. Better
 a clear connection failure than a wallet that quietly believes something false.
 
-Servers on chains with no v2 headers keep negotiating as they do now. Nothing changes for
-them.
+Refusing at `server.version` is not sufficient on its own, which the implementation made
+obvious and this document originally missed. A chain crosses its activation height while
+clients are connected. A client that negotiated 1.4 below it keeps that session and is
+served v2 headers the moment the tip reaches the activation, which is exactly the outcome
+the refusal exists to prevent. This is not a corner case: it is what happens on every fresh
+sync of a chain that has already forked, where the tip climbs past the activation with
+wallets already attached.
+
+So a server should record what each client negotiated and check it where headers are
+served, not only where the version is agreed. That means `blockchain.block.header`,
+`blockchain.block.headers`, `blockchain.headers.subscribe` and the tip notification. A
+subscribed client that can no longer read the tip should be disconnected rather than sent
+it; it reconnects and meets the refusal, which can say why.
+
+Servers on chains with no v2 headers keep negotiating as they do now, and the check
+short-circuits there. Nothing changes for them.
 
 ### 3. Header length must be read, not assumed
 
@@ -147,6 +168,20 @@ the 1.6 list form, where each element is simply already separated.
 
 1.8 should state that a header is 80 or 164 bytes, that the length is determined by bit 31
 of the version field, and that this holds in both the concatenated and list forms.
+
+Reading both forms is mandatory for a 1.8 client, not a convenience, and the reason is a
+consequence of the version bump rather than of the header format. Raising a client's
+negotiated maximum to 1.8 changes which form it receives from any server that caps between
+its old maximum and the new one. Measured: Fulcrum 2.1.2 answers a range topping out at
+1.4.2 with the concatenated string and a range topping out at 1.8 with the list. A client
+that implements 1.8 but reads only the form it used to receive breaks against those servers
+on every chain, including chains with no v2 header anywhere. That is a regression introduced
+by adopting 1.8, so it belongs in the specification of 1.8.
+
+The same applies to a length check separate from the split. An implementation may validate
+that a response carries as many bytes as it claims headers before parsing any of them; that
+check has to walk the run too, or it refuses the chain one layer above the code that can
+read it.
 
 Servers may want to lower `max` on a v2 chain. At 2016 headers the response roughly doubles.
 
@@ -327,13 +362,51 @@ Header layout is in `src/primitives/block.h`. `GetHash()` is in
 
 ## Status
 
-The protocol changes proposed here are not implemented anywhere yet. The hash is: the
-implementation described above passes the published vectors and reproduces live block
-hashes, so the expensive-looking half of client support is known to be tractable.
+Both halves are now implemented, against a fork of electrs 0.11.1 and a fork of Sparrow.
+Neither is upstream, and neither is proposed as the reference implementation; they exist to
+find out what the work costs and where the specification is underdetermined. If someone is
+already doing this in Fulcrum or ElectrumX, I would rather join that than duplicate it.
 
-I am working on the indexer side in electrs and will report what the parsing work actually
-costs once it is done. If someone is already doing this in Fulcrum or ElectrumX, I would
-rather join that than duplicate it.
+What it cost, since that was the open question:
+
+| what | where | lines |
+|---|---|---|
+| the header type and the hash, with tests and the published vectors | electrs, Rust | 975 |
+| protocol 1.8, the refusal and the fork point | electrs, Rust | 157, plus 134 changed across three call sites |
+| the header type and the hash, with tests | drongo, Java | 435, plus 60 changed in `BlockHeader` |
+| both response forms, the walk, the store stride, with tests | Sparrow, Java | 371, plus 108 changed across five call sites |
+
+The hash and the header type dominate on both sides, and they are the part that is fully
+specified by Knots and its published vectors. The protocol work proper is small.
+
+Server side, items 1, 2, 3 and 5 are done, and item 4 is not, because electrs implements no
+`cp_height` at all. Client side, items 1 and 3 are done and item 5 is not: the server
+reports the fork point and nothing yet checks it.
+
+Three things the implementations taught, which are why they were worth doing:
+
+**Refusing at `server.version` is not enough.** A chain crosses its activation height while
+clients are connected, so a client that negotiated 1.4 below it keeps its session and is
+served v2 headers the moment the tip reaches the activation. That is not a corner case: it
+is what happens on every fresh sync of a chain that has already forked. The rule has to be
+checked where headers are served, not only where the version is agreed, and a subscribed
+client that can no longer read the tip has to be disconnected. Section 2 should say so.
+
+**Item 3 is not optional for a client that raises its maximum.** Raising Sparrow's
+negotiated maximum to 1.8 changed which response form it receives from servers that cap in
+between: Fulcrum 2.1.2 answers 1.4.2 with the concatenated string and 1.6 with the list. A
+client that implements 1.8 but reads only the form it used to get breaks against those
+servers on every chain, including ones with no v2 header anywhere. Both forms are
+mandatory, which section 3 implies but does not say outright.
+
+**Fixed-length assumptions are not only at the split.** Sparrow had one at the split and a
+second one a layer above it, in the check that a response carries as many bytes as it
+claims headers. The second refused the chain before the first was reached. Anyone
+implementing this should grep for the length rather than for the slicing.
+
+Open question 4 above asked whether anything else in the protocol assumes 80 bytes. On
+these two implementations, no: `hashMerkleRoot` is unmoved and every merkle proof, scripthash
+method and broadcast path was untouched. That is two data points, not a survey.
 
 There is precedent for specifying a layer that sits outside the node. luke-jr has said a
 BIP is to be written for the `getblocktemplate` BLAKE2b extensions, which is the same shape

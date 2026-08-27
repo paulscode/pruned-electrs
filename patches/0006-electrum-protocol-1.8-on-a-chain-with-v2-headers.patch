@@ -1,7 +1,7 @@
-From 4f7a4ad528df9532ac6cc84546add991764ac381 Mon Sep 17 00:00:00 2001
+From 787aa35b9fb57e8a1f054da85e8b548a9ed8cb77 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Tue, 25 Aug 2026 06:02:19 -0500
-Subject: [PATCH 6/6] electrum: protocol 1.8 on a chain with v2 headers
+Subject: [PATCH] electrum: protocol 1.8 on a chain with v2 headers
 
 Implements the server half of docs/electrum-header-v2.md, kept in one
 place so replacing it with whatever upstream settles on means deleting a
@@ -20,6 +20,27 @@ The refusal is the safety-critical half, not the number. A client below
 gets something structurally plausible, computes SHA256d over it, and
 cannot link the chain. The error says so, because a bare "unsupported
 request" would send someone hunting the wrong fault.
+
+Refusing at server.version is not enough on its own, because a chain
+crosses its activation height while clients are connected. A client that
+negotiated 1.4 below it kept its session and was served v2 headers the
+moment the tip reached the activation, which is the exact outcome the
+refusal exists to prevent. It is not a corner case: it is what happens on
+every fresh sync of a chain that has already forked, where the tip climbs
+past the activation with wallets attached. So the negotiated version is
+recorded on the client and the rule is checked where headers are served,
+which is block.header, block.headers, headers.subscribe and the tip
+notification. A subscribed client that cannot read the new tip is
+disconnected rather than sent it, and reconnects into the refusal at
+server.version, which says why. A client that never sent server.version
+is refused for the same reason: it has not said it can read this chain.
+Nothing changes on a chain without v2 headers, which is where the check
+short-circuits.
+
+notify_peers now logs the cause chain rather than only its outermost
+context. A peer dropped on that path is no longer necessarily a fault,
+and "failed to notify peer 0: failed to generate notifications" sends
+whoever reads it hunting a bug that is not there.
 
 server.features gains blake2b_fork, because genesis_hash cannot carry
 chain identity on a fork that keeps its history: this chain and ordinary
@@ -41,11 +62,19 @@ Below it: Sparrow's range and Electrum's both negotiate 1.4, features
 report 1.4 and no fork point. Above it: both are refused with the
 explanation, a 1.8 client gets 1.8, and blake2b_fork reports height 20
 with the right hash, found by search rather than told.
+
+And across it, which is the case the connect-time refusal cannot cover. A
+client negotiated 1.4 at height 15 and subscribed, getting an 80 byte
+header. The chain was then mined to 25, past an activation at 20. At the
+moment electrs indexed height 20 the client was disconnected rather than
+served, with the reason in the log; reconnecting at 1.4 was refused and
+at 1.8 returned 328 bytes for 2 headers.
 ---
- src/chain.rs    |  16 +++++++
- src/electrum.rs |  61 +++++++++++++++++++++-----
- src/headerv2.rs | 111 ++++++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 178 insertions(+), 10 deletions(-)
+ src/chain.rs    |  16 +++++
+ src/electrum.rs | 112 +++++++++++++++++++++++++++++-----
+ src/headerv2.rs | 159 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/server.rs   |   6 +-
+ 4 files changed, 276 insertions(+), 17 deletions(-)
 
 diff --git a/src/chain.rs b/src/chain.rs
 index 7471eb7..74e26d6 100644
@@ -75,7 +104,7 @@ index 7471eb7..74e26d6 100644
      pub(crate) fn tip(&self) -> BlockHash {
          self.headers.last().expect("empty chain").0
 diff --git a/src/electrum.rs b/src/electrum.rs
-index 4a30e15..abd4b8d 100644
+index 4a30e15..f238b23 100644
 --- a/src/electrum.rs
 +++ b/src/electrum.rs
 @@ -24,7 +24,9 @@ use crate::{
@@ -89,17 +118,93 @@ index 4a30e15..abd4b8d 100644
  const UNKNOWN_FEE: isize = -1; // (allowed by Electrum protocol)
  
  const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method of querying electrs, consider contacting the developer of your wallet. Reason:";
-@@ -492,25 +494,64 @@ impl Rpc {
+@@ -34,6 +36,10 @@ const UNSUBSCRIBED_QUERY_MESSAGE: &str = "your wallet uses less efficient method
+ pub struct Client {
+     tip: Option<BlockHash>,
+     scripthashes: HashMap<ScriptHash, ScriptHashStatus>,
++    /// What `server.version` agreed on, or `None` from a client that has not
++    /// sent it. Kept because the version rule outlives the handshake: see
++    /// `headerv2::may_serve_headers`.
++    negotiated: Option<&'static str>,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -211,6 +217,11 @@ impl Rpc {
+         if let Some(old_tip) = client.tip {
+             let new_tip = self.tracker.chain().tip();
+             if old_tip != new_tip {
++                //The chain may have crossed its activation height since this client subscribed, in
++                //which case the tip it is about to be handed is one it cannot read. Erroring here
++                //disconnects it, which is the intended outcome: it reconnects and is refused at
++                //server.version with a message saying why
++                self.check_may_serve_headers(client)?;
+                 client.tip = Some(new_tip);
+                 let height = chain.height();
+                 let header = chain.get_block_header(height).unwrap();
+@@ -224,6 +235,7 @@ impl Rpc {
+     }
+ 
+     fn headers_subscribe(&self, client: &mut Client) -> Result<Value> {
++        self.check_may_serve_headers(client)?;
+         let chain = self.tracker.chain();
+         client.tip = Some(chain.tip());
+         let height = chain.height();
+@@ -231,7 +243,8 @@ impl Rpc {
+         Ok(json!({"hex": header.serialize_hex(), "height": height}))
+     }
+ 
+-    fn block_header(&self, (height,): (usize,)) -> Result<Value> {
++    fn block_header(&self, client: &Client, (height,): (usize,)) -> Result<Value> {
++        self.check_may_serve_headers(client)?;
+         let chain = self.tracker.chain();
+         let header = match chain.get_block_header(height) {
+             None => bail!("no header at {}", height),
+@@ -240,7 +253,12 @@ impl Rpc {
+         Ok(json!(header.serialize_hex()))
+     }
+ 
+-    fn block_headers(&self, (start_height, count): (usize, usize)) -> Result<Value> {
++    fn block_headers(
++        &self,
++        client: &Client,
++        (start_height, count): (usize, usize),
++    ) -> Result<Value> {
++        self.check_may_serve_headers(client)?;
+         let chain = self.tracker.chain();
+         let max_count = 2016usize;
+         // return only the available block headers
+@@ -492,25 +510,87 @@ impl Rpc {
          format!("electrs/{}", ELECTRS_VERSION)
      }
  
+-    fn version(&self, (client_id, client_version): &(String, VersionRequest)) -> Result<Value> {
 +    /// The version this chain negotiates. 1.4 as upstream, except on a chain
 +    /// whose headers are v2, where it is 1.8; see `headerv2::protocol_version`.
 +    fn protocol_version(&self) -> &'static str {
 +        crate::headerv2::protocol_version(self.tracker.chain().has_v2_headers())
 +    }
 +
-     fn version(&self, (client_id, client_version): &(String, VersionRequest)) -> Result<Value> {
++    /// Refuses a header request from a client that cannot read this chain's
++    /// headers; see `headerv2::may_serve_headers` for why this is checked here
++    /// and not only at `server.version`.
++    fn check_may_serve_headers(&self, client: &Client) -> Result<()> {
++        let chain_has_v2 = self.tracker.chain().has_v2_headers();
++        if crate::headerv2::may_serve_headers(chain_has_v2, client.negotiated) {
++            Ok(())
++        } else {
++            bail!(
++                "refusing block headers to a client at protocol {}: {}",
++                client.negotiated.unwrap_or("(unnegotiated)"),
++                crate::headerv2::HEADER_REFUSAL
++            )
++        }
++    }
++
++    fn version(
++        &self,
++        client: &mut Client,
++        (client_id, client_version): &(String, VersionRequest),
++    ) -> Result<Value> {
 +        let version = self.protocol_version();
          match client_version {
 -            VersionRequest::Single(exact) => check_between(PROTOCOL_VERSION, exact, exact),
@@ -125,6 +230,9 @@ index 4a30e15..abd4b8d 100644
 +                format!("unsupported request {:?} by {}", client_version, client_id)
 +            }
 +        })?;
++        //Recorded only once the range has been accepted, so a refused handshake leaves the client
++        //exactly as unnegotiated as it was
++        client.negotiated = Some(version);
 +        Ok(json!([self.server_id(), version]))
      }
  
@@ -163,11 +271,31 @@ index 4a30e15..abd4b8d 100644
      }
  
      pub fn handle_requests(&self, client: &mut Client, lines: &[String]) -> Vec<String> {
+@@ -594,8 +674,8 @@ impl Rpc {
+             }
+             let result = match &call.params {
+                 Params::Banner => Ok(json!(self.banner)),
+-                Params::BlockHeader(args) => self.block_header(*args),
+-                Params::BlockHeaders(args) => self.block_headers(*args),
++                Params::BlockHeader(args) => self.block_header(client, *args),
++                Params::BlockHeaders(args) => self.block_headers(client, *args),
+                 Params::Donation => Ok(Value::Null),
+                 Params::EstimateFee(args) => self.estimate_fee(*args),
+                 Params::Features => self.features(),
+@@ -616,7 +696,7 @@ impl Rpc {
+                 Params::TransactionGet(args) => self.transaction_get(args),
+                 Params::TransactionGetMerkle(args) => self.transaction_get_merkle(args),
+                 Params::TransactionFromPosition(args) => self.transaction_from_pos(*args),
+-                Params::Version(args) => self.version(args),
++                Params::Version(args) => self.version(client, args),
+             };
+             call.response(result)
+         })
 diff --git a/src/headerv2.rs b/src/headerv2.rs
-index 9863c60..317b513 100644
+index 9863c60..76b8302 100644
 --- a/src/headerv2.rs
 +++ b/src/headerv2.rs
-@@ -971,3 +971,114 @@ mod tests {
+@@ -971,3 +971,162 @@ mod tests {
          assert!(AnyHeader::parse_all(&v2[..HEADER_V2_SIZE - 1]).is_err());
      }
  }
@@ -181,7 +309,7 @@ index 9863c60..317b513 100644
 +// section and the handful of call sites that name it, rather than unpicking
 +// edits spread through `electrum.rs`.
 +//
-+// The proposal is `docs/electrum-header-v2.md` in the pruned-electrs repo. Only
++// The proposal is `docs/electrum-header-v2.md` in the electrs-pruned repo. Only
 +// the parts that apply to this server are implemented:
 +//
 +//   1. Protocol version 1.8.
@@ -223,6 +351,33 @@ index 9863c60..317b513 100644
 +        PROTOCOL_VERSION_V1
 +    }
 +}
++
++/// May a client that negotiated this version be served block headers?
++///
++/// Refusing at `server.version` is not enough on its own, because a chain
++/// crosses its activation height while clients are connected. A client that
++/// negotiated 1.4 below the activation would otherwise keep its session and be
++/// served v2 headers the moment the chain reaches it, which is the exact
++/// outcome the refusal exists to prevent. It is not a corner case either: it is
++/// what happens on every fresh sync of a chain that has already forked, where
++/// the tip climbs past the activation with wallets already attached.
++///
++/// So the rule is checked where headers are served rather than only where the
++/// version is agreed. A chain with no v2 header serves anyone, exactly as
++/// before, so nothing changes anywhere else.
++///
++/// `None` is a client that has not sent `server.version` at all. Protocol 1.6
++/// requires it first, and a client that skips it has not said it can read this
++/// chain, so it is refused for the same reason.
++pub fn may_serve_headers(chain_has_v2: bool, negotiated: Option<&str>) -> bool {
++    !chain_has_v2 || negotiated == Some(PROTOCOL_VERSION_V2)
++}
++
++/// Why a header request was refused, for the client's log.
++pub const HEADER_REFUSAL: &str =
++    "this chain uses 164-byte block headers with a BLAKE2b block hash, \
++     which a client below protocol 1.8 cannot read. Reconnect and negotiate 1.8. Refusing rather \
++     than serving headers it would misinterpret.";
 +
 +/// Where this chain's headers changed format, for `server.features`.
 +///
@@ -281,7 +436,45 @@ index 9863c60..317b513 100644
 +    fn a_pre_activation_chain_is_unchanged() {
 +        assert_eq!(protocol_version(false), PROTOCOL_VERSION_V1);
 +    }
++
++    /// Nothing about serving headers changes on a chain without them, whatever
++    /// the client negotiated or failed to negotiate.
++    #[test]
++    fn a_chain_without_v2_headers_serves_anyone() {
++        for negotiated in [None, Some("1.4"), Some("1.2"), Some("1.8")] {
++            assert!(may_serve_headers(false, negotiated), "{:?}", negotiated);
++        }
++    }
++
++    /// The case the connect-time refusal cannot cover: a session opened below
++    /// the activation height, still open above it.
++    #[test]
++    fn a_v2_chain_serves_only_a_client_that_negotiated_18() {
++        assert!(may_serve_headers(true, Some(PROTOCOL_VERSION_V2)));
++        assert!(!may_serve_headers(true, Some(PROTOCOL_VERSION_V1)));
++        assert!(
++            !may_serve_headers(true, None),
++            "a client that never negotiated has not said it can read this chain"
++        );
++    }
 +}
+diff --git a/src/server.rs b/src/server.rs
+index f50662f..b5b0cb9 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -136,7 +136,11 @@ fn notify_peers(rpc: &Rpc, peers: HashMap<usize, Peer>) -> HashMap<usize, Peer>
+         .filter_map(|(_, mut peer)| match notify_peer(rpc, &mut peer) {
+             Ok(()) => Some((peer.id, peer)),
+             Err(e) => {
+-                error!("failed to notify peer {}: {}", peer.id, e);
++                // Alternate form, so the cause travels with the message. A peer is dropped here
++                // for reasons that are not all faults: on a chain with v2 headers a client that
++                // negotiated below 1.8 is disconnected deliberately, and "failed to notify" alone
++                // sends whoever reads the log hunting a bug that is not there.
++                error!("failed to notify peer {}: {:#}", peer.id, e);
+                 peer.disconnect();
+                 None
+             }
 -- 
 2.43.0
 

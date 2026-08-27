@@ -1,58 +1,134 @@
-From 7e9eadef0e8dc796dfe84fb0320f9899cfb0a852 Mon Sep 17 00:00:00 2001
-From: pruned-electrs <paul@paulscode.com>
-Date: Tue, 25 Aug 2026 06:16:20 -0500
+From 39d0ed2421d89595f5f71467e5005262fe031200 Mon Sep 17 00:00:00 2001
+From: electrs-pruned <paul@paulscode.com>
+Date: Wed, 26 Aug 2026 18:38:37 -0500
 Subject: [sparrow PATCH] Follow a chain whose block headers are not all 80
  bytes
 
 The client half of docs/electrum-header-v2.md. Needs the drongo patch
 beside it, which is what actually reads and hashes a v2 header; this is
-the three places Sparrow had a literal 80 in it.
+everywhere Sparrow assumed a header is 80 bytes.
 
 VariableHeaders holds all of it, so removing support later is a file
 deletion plus reverting the call sites that name it.
 
-  - blockchain.block.headers returns one concatenated hex string below
-    protocol 1.6, and Sparrow negotiates below that, so it always
-    receives that form and has to walk it. Three call sites sliced it on
-    a fixed stride; on a chain spanning the activation a 40 header
-    response is 4964 bytes, which a fixed stride reads as 62 headers of
-    garbage. The walk reads each header's length from its own version
-    field and fails if it does not land exactly on the end.
+  - blockchain.block.headers arrives as one concatenated hex string
+    below protocol 1.6 and as a list of them at 1.6 and above. Both are
+    read now. Three call sites sliced the concatenated form on a fixed
+    stride; on a chain spanning the activation a 40 header response is
+    4964 bytes, which a fixed stride reads as 62 headers of garbage. The
+    walk reads each header's length from its own version field and fails
+    if it does not land exactly on the end.
+
+  - checkBlockHeaders enforced that same stride on the whole response,
+    one layer above those call sites, so a chain carrying 164 byte
+    headers was refused before anything that could read them was
+    reached. It now counts the run rather than dividing it, walking the
+    hex without decoding it so the check stays as cheap as it was.
+
+  - The list form is not optional given the version bump below. Fulcrum
+    2.1.2 caps at 1.6 and answers in that form, so a client offering 1.8
+    receives the list where one offering 1.4.2 received the string.
+    Reading only the string would break header sync against a Fulcrum
+    server on every network, mainnet included.
+
+  - A header marked v2 is refused on a network that cannot carry one, so
+    mainnet is exactly as strict as it was before variable lengths
+    existed: 80 bytes and nothing else. Regtest joins testnet4 in being
+    able to, since a node there activates BLAKE2b with
+    -testactivationheight and that is where this is exercised.
 
   - The on-disk store indexes by height times a stride, so the stride is
     now per network rather than per header and an 80 byte header is
-    padded out where both can occur. Only testnet4 can, so every other
-    network is byte-for-byte as before and existing mainnet stores are
-    untouched. A store written with the other stride is already handled:
+    padded out where both can occur. Only testnet4 and regtest can, so
+    every other network is byte-for-byte as before and existing mainnet
+    stores are untouched. A store written with the other stride is already handled:
     one whose first record does not descend from the pin is discarded and
     re-downloaded, and a padded record cannot descend from anything.
 
   - SUPPORTED_VERSIONS reaches 1.8. A server on a chain with v2 headers
     refuses to negotiate below it, so this is what makes such a chain
     reachable at all; the range is a minimum and a maximum, so servers
-    elsewhere still negotiate 1.4.2.
+    elsewhere still negotiate the highest they support at or below it.
 
 Sparrow's checkpoints are not in the way: testnet4 pins 74 periods, so
 149183, which is 354 blocks below the activation and on shared history.
 
-Blake2bChainSyncHarness drives the whole path against a live server and
-is a main rather than a test, since it needs one. Against electrs on a
-regtest chain activating at 20: negotiated 1.8, split 40 headers into 19
-v1 and 21 v2, and HeaderChainState accepted all 40 under its linkage,
-difficulty, proof-of-work and median-time-past rules. 195 Sparrow tests
-still pass.
+BlockHeadersResponseTest takes a response through the path a running
+Sparrow uses, from the JSON-RPC call through deserialization and the
+checks to the split, in both forms. It uses the real testnet4 headers
+149536 and 149537, the last v1 header and the first v2 one, and asserts
+both hashes and that 149537 names 149536 as its parent. Restoring the
+fixed stride fails it, which is what makes it a regression test rather
+than a description of the code.
+
+Blake2bChainSyncHarness drives a live server and is a main rather than a
+test, since it needs one. It now goes through SimpleElectrumServerRpc
+over a real transport rather than speaking JSON-RPC itself: the earlier
+version reimplemented the client, which is why it could not see the
+checkBlockHeaders layer. Against electrs on a regtest chain activating at
+20: negotiated 1.8, took a 4964 byte response for 40 headers through the
+checks, read 19 v1 and 21 v2, and HeaderChainState accepted all 40 under
+its linkage, difficulty, proof-of-work and median-time-past rules.
+Restoring the fixed stride stops it at checkBlockHeaders.
+
+Blake2bLiveHeadersHarness does the same against the live chain rather than
+a made one. Nothing about that data is chosen: the headers come off a fork
+peer over p2p, the anchor is the last checkpoint Sparrow already ships for
+testnet4 at height 149183, and the difficulty targets, timestamps and
+proof of work are whatever the network produced. 600 headers from 149184,
+353 v1 and 247 v2, with the first v2 header at 149537, which is the
+documented activation height found from the data rather than told to it.
+All 600 passed checkBlockHeaders and then HeaderChainState.
+
+202 Sparrow tests pass, with drongo at 542 and lark at 3.
 ---
- .../sparrow/net/ElectrumServer.java           |  12 +-
- .../sparrow/net/HeaderStore.java              |  45 ++++---
- .../sparrow/net/VariableHeaders.java          | 113 ++++++++++++++++++
- .../sparrow/net/Blake2bChainSyncHarness.java  | 104 ++++++++++++++++
- .../sparrow/net/HeaderStoreTest.java          |  18 +--
- 5 files changed, 265 insertions(+), 27 deletions(-)
+ .../sparrow/net/BlockHeaders.java             |  11 +-
+ .../sparrow/net/ElectrumServer.java           |  15 +-
+ .../sparrow/net/ElectrumServerRpc.java        |  15 +-
+ .../sparrow/net/HeaderStore.java              |  45 ++--
+ .../sparrow/net/VariableHeaders.java          | 227 ++++++++++++++++++
+ .../sparrow/net/Blake2bChainSyncHarness.java  |  90 +++++++
+ .../net/Blake2bLiveHeadersHarness.java        |  97 ++++++++
+ .../sparrow/net/BlockHeadersResponseTest.java | 144 +++++++++++
+ .../sparrow/net/HeaderStoreTest.java          |  22 +-
+ 9 files changed, 629 insertions(+), 37 deletions(-)
  create mode 100644 src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java
  create mode 100644 src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java
+ create mode 100644 src/test/java/com/sparrowwallet/sparrow/net/Blake2bLiveHeadersHarness.java
+ create mode 100644 src/test/java/com/sparrowwallet/sparrow/net/BlockHeadersResponseTest.java
 
+diff --git a/src/main/java/com/sparrowwallet/sparrow/net/BlockHeaders.java b/src/main/java/com/sparrowwallet/sparrow/net/BlockHeaders.java
+index 49a174e1..57911b3b 100644
+--- a/src/main/java/com/sparrowwallet/sparrow/net/BlockHeaders.java
++++ b/src/main/java/com/sparrowwallet/sparrow/net/BlockHeaders.java
+@@ -2,8 +2,14 @@ package com.sparrowwallet.sparrow.net;
+ 
+ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
++import java.util.List;
++
+ /**
+- * The blockchain.block.headers response: a run of consecutive block headers as concatenated hex, with the maximum number of headers the server will return.
++ * The blockchain.block.headers response: a run of consecutive block headers, with the maximum number of headers the server will return.
++ * <p>
++ * The run comes in one of two forms and never both. Below protocol 1.6 it is one concatenated hex string in {@code hex}; at 1.6 and above
++ * it is a list of hex strings in {@code headers}. Which arrives depends on what was negotiated, so a client offering a range spanning 1.6
++ * has to accept either. See {@link VariableHeaders}, which reads both.
+  */
+ @JsonIgnoreProperties(ignoreUnknown = true)
+ public class BlockHeaders {
+@@ -15,7 +21,8 @@ public class BlockHeaders {
+     public static final BlockHeaders ERROR_HEADERS = new BlockHeaders();
+ 
+     public int count;
+-    public String hex;
++    public String hex;          //protocol 1.5 and below
++    public List<String> headers;    //protocol 1.6 and above
+     public int max;
+ 
+     @Override
 diff --git a/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java b/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java
-index 741a607..837e301 100644
+index 741a6072..f023453c 100644
 --- a/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java
 +++ b/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServer.java
 @@ -54,7 +54,11 @@ import java.util.stream.Stream;
@@ -68,35 +144,71 @@ index 741a607..837e301 100644
  
      private static final Version ELECTRS_MIN_BATCHING_VERSION = new Version("0.9.0");
  
-@@ -994,7 +998,7 @@ public class ElectrumServer {
+@@ -993,8 +997,7 @@ public class ElectrumServer {
+             try {
                  //Parsed whole here rather than one at a time below, so that a chunk carrying fewer headers than it claims is a refusal like any other
                  //malformed response rather than an exception escaping the sync
-                 byte[] bytes = Utils.hexToBytes(chunk.hex);
+-                byte[] bytes = Utils.hexToBytes(chunk.hex);
 -                headers = IntStream.range(0, chunk.count).mapToObj(i -> new BlockHeader(bytes, i * HeaderStore.HEADER_LENGTH)).toList();
-+                headers = VariableHeaders.split(bytes, chunk.count);
++                headers = VariableHeaders.parse(chunk, chunk.count);
              } catch(ProtocolException | IllegalArgumentException e) {
                  //Refusal class, as a short chunk is: the server could not substantiate the range
                  throw new VerificationException("Server returned a malformed header chunk from height " + startHeight, e);
-@@ -1029,7 +1033,7 @@ public class ElectrumServer {
+@@ -1028,8 +1031,7 @@ public class ElectrumServer {
+ 
          List<BlockHeader> candidate;
          try {
-             byte[] bytes = Utils.hexToBytes(chunk.hex);
+-            byte[] bytes = Utils.hexToBytes(chunk.hex);
 -            candidate = IntStream.range(0, count).mapToObj(i -> new BlockHeader(bytes, i * HeaderStore.HEADER_LENGTH)).toList();
-+            candidate = VariableHeaders.split(bytes, count);
++            candidate = VariableHeaders.parse(chunk, count);
          } catch(ProtocolException | IllegalArgumentException e) {
              throw new VerificationException("Server returned a malformed header chunk when reconciling to height " + endHeight, e);
          }
-@@ -1180,7 +1184,7 @@ public class ElectrumServer {
+@@ -1179,8 +1181,7 @@ public class ElectrumServer {
+ 
          List<BlockHeader> headers;
          try {
-             byte[] bytes = Utils.hexToBytes(chunk.hex);
+-            byte[] bytes = Utils.hexToBytes(chunk.hex);
 -            headers = IntStream.range(0, count).mapToObj(i -> new BlockHeader(bytes, i * HeaderStore.HEADER_LENGTH)).toList();
-+            headers = VariableHeaders.split(bytes, count);
++            headers = VariableHeaders.parse(chunk, count);
          } catch(ProtocolException | IllegalArgumentException e) {
              return null;
          }
+diff --git a/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServerRpc.java b/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServerRpc.java
+index f93dada7..21a0d27a 100644
+--- a/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServerRpc.java
++++ b/src/main/java/com/sparrowwallet/sparrow/net/ElectrumServerRpc.java
+@@ -172,7 +172,7 @@ public interface ElectrumServerRpc {
+     }
+ 
+     static BlockHeaders checkBlockHeaders(BlockHeaders blockHeaders, int startHeight, int count, Integer tip) throws VerificationException {
+-        if(blockHeaders == null || blockHeaders.hex == null || blockHeaders.count < 0) {
++        if(blockHeaders == null || blockHeaders.count < 0) {
+             throw new VerificationException("Malformed response to a request for " + count + " block headers from height " + startHeight);
+         }
+         if(blockHeaders.max < HeaderChainState.RETARGET_INTERVAL) {
+@@ -181,9 +181,16 @@ public interface ElectrumServerRpc {
+         if(blockHeaders.count > count) {
+             throw new VerificationException("Requested " + count + " block headers from height " + startHeight + " but the server returned " + blockHeaders.count);
+         }
+-        if(blockHeaders.hex.length() != blockHeaders.count * BlockHeaders.HEADER_HEX_LENGTH) {
+-            throw new VerificationException("Response to a request for block headers from height " + startHeight + " contains " + blockHeaders.hex.length() / 2
+-                    + " bytes for " + blockHeaders.count + " headers");
++        //Counted rather than divided, because a header is 80 bytes or 164 and the run may hold both, and because the run arrives concatenated
++        //below protocol 1.6 and as a list at 1.6 and above. VariableHeaders reads either, without decoding anything here
++        int carried = VariableHeaders.countCarried(blockHeaders);
++        if(carried < 0) {
++            throw new VerificationException("Response to a request for " + count + " block headers from height " + startHeight
++                    + " does not hold a whole run of headers in either form");
++        }
++        if(carried != blockHeaders.count) {
++            throw new VerificationException("Response to a request for block headers from height " + startHeight + " carries " + carried
++                    + " headers for a reported count of " + blockHeaders.count);
+         }
+ 
+         if(blockHeaders.count < count && tip != null && startHeight + blockHeaders.count - 1 < tip) {
 diff --git a/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java b/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java
-index b6b0bb5..4480836 100644
+index b6b0bb59..44808368 100644
 --- a/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java
 +++ b/src/main/java/com/sparrowwallet/sparrow/net/HeaderStore.java
 @@ -21,8 +21,8 @@ import java.math.BigInteger;
@@ -207,13 +319,14 @@ index b6b0bb5..4480836 100644
  }
 diff --git a/src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java b/src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java
 new file mode 100644
-index 0000000..a1e1603
+index 00000000..490540f1
 --- /dev/null
 +++ b/src/main/java/com/sparrowwallet/sparrow/net/VariableHeaders.java
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,227 @@
 +package com.sparrowwallet.sparrow.net;
 +
 +import com.sparrowwallet.drongo.Network;
++import com.sparrowwallet.drongo.Utils;
 +import com.sparrowwallet.drongo.protocol.BlockHeader;
 +import com.sparrowwallet.drongo.protocol.BlockHeaderV2;
 +import com.sparrowwallet.drongo.protocol.ProtocolException;
@@ -232,16 +345,20 @@ index 0000000..a1e1603
 + * <p>Everything in Sparrow that had a literal 80 in it routes through this
 + * class, so that removing support later is a file deletion plus reverting the
 + * call sites that name it. See {@code docs/electrum-header-v2.md} in the
-+ * pruned-electrs repo for the protocol proposal this implements the client half
++ * electrs-pruned repo for the protocol proposal this implements the client half
 + * of.
 + *
 + * <p>Two things make this necessary rather than cosmetic. The Electrum protocol
 + * returns {@code blockchain.block.headers} as one concatenated hex string below
-+ * protocol 1.6, and Sparrow negotiates 1.4.2, so it always receives that form
-+ * and has to walk it. And the on-disk header store indexes by height times a
-+ * fixed stride, which a variable record length would break.
++ * protocol 1.6 and as a list at 1.6 and above, so both forms have to be handled
++ * and the concatenated one has to be walked. And the on-disk header store
++ * indexes by height times a fixed stride, which a variable record length would
++ * break.
 + */
 +public class VariableHeaders {
++    /** An 80 byte header as hex, which is the length every header had before this. */
++    public static final int V1_HEX_LENGTH = BlockHeaderV2.HEADER_V1_LENGTH * 2;
++
 +    /**
 +     * The on-disk record size for this network.
 +     *
@@ -258,14 +375,123 @@ index 0000000..a1e1603
 +    /**
 +     * Can this network carry v2 headers?
 +     *
-+     * <p>testnet4 only. The BLAKE2b fork activates there at height 149537 and
-+     * nowhere else: mainnet's {@code Blake2bHeight} is unscheduled, and regtest
-+     * would need {@code -testactivationheight}, which is a node-side setting a
-+     * wallet cannot see. Keeping this narrow means every other network takes
-+     * exactly the path it took before.
++     * <p>testnet4, where the BLAKE2b fork activated at height 149537, and
++     * regtest, where a node can activate it with {@code -testactivationheight}
++     * and where this is therefore tested. Nowhere else: mainnet's
++     * {@code Blake2bHeight} is unscheduled, and testnet3 and signet have no
++     * such deployment. Keeping it that narrow means every other network takes
++     * exactly the path it took before, and a 164 byte header offered on one is
++     * refused rather than read.
++     *
++     * <p>Ordinary testnet4 is included along with the forked one, because a
++     * wallet cannot tell them apart before connecting. The only visible effect
++     * there is the store stride below.
 +     */
 +    public static boolean supportsV2(Network network) {
-+        return network == Network.TESTNET4;
++        return network == Network.TESTNET4 || network == Network.REGTEST;
++    }
++
++    /**
++     * The length of a header of the given kind, refusing a v2 one where the
++     * network cannot carry it.
++     *
++     * <p>The refusal keeps every other network exactly as strict as it was
++     * before this class existed: mainnet accepted 80 bytes and nothing else,
++     * and a server setting bit 31 there is answering about a chain the client
++     * did not ask for.
++     */
++    private static int lengthFor(boolean v2) throws ProtocolException {
++        if(!v2) {
++            return BlockHeaderV2.HEADER_V1_LENGTH;
++        }
++        if(!supportsV2(Network.get())) {
++            throw new ProtocolException("Block header marked v2 on " + Network.get() + ", which cannot carry one");
++        }
++        return BlockHeaderV2.HEADER_V2_LENGTH;
++    }
++
++    /**
++     * The headers a response carries, in whichever form it uses, or -1 if that
++     * is not a whole run of headers.
++     *
++     * <p>Counted without decoding, so this stays the cheap structural check
++     * that {@link ElectrumServerRpc#checkBlockHeaders} needs before anything is
++     * parsed. Exactly one form must be present: {@code hex} below protocol 1.6
++     * and {@code headers} at 1.6 and above, and a response carrying both is as
++     * malformed as one carrying neither, since there is no saying which the
++     * server meant.
++     */
++    public static int countCarried(BlockHeaders chunk) {
++        if((chunk.hex == null) == (chunk.headers == null)) {
++            return -1;
++        }
++        if(chunk.headers == null) {
++            return countHex(chunk.hex);
++        }
++        for(String header : chunk.headers) {
++            if(header == null || countHex(header) != 1) {
++                return -1;
++            }
++        }
++        return chunk.headers.size();
++    }
++
++    /**
++     * The number of headers a concatenated hex run holds, or -1 if the walk
++     * does not land exactly on its end.
++     */
++    public static int countHex(String hex) {
++        int offset = 0;
++        int count = 0;
++        while(offset < hex.length()) {
++            if(offset + V1_HEX_LENGTH > hex.length()) {
++                return -1;
++            }
++            int length;
++            try {
++                //The version is four bytes little endian, so bit 31 is the high bit of the fourth byte, hex characters 6 and 7
++                int fourthByte = Integer.parseInt(hex, offset + 6, offset + 8, 16);
++                length = lengthFor((fourthByte & 0x80) != 0) * 2;
++            } catch(ProtocolException | NumberFormatException e) {
++                return -1;
++            }
++            if(offset + length > hex.length()) {
++                return -1;
++            }
++            offset += length;
++            count++;
++        }
++        return count;
++    }
++
++    /**
++     * The headers a response carries, decoded, in whichever form it uses.
++     *
++     * <p>The list form needs no walk, since protocol 1.6 already separated the
++     * headers, but each element is still put through {@link #split} so that one
++     * rule decides what a header is: an element carrying trailing bytes is a
++     * server disagreeing with the client about the format, which is the thing
++     * worth failing on.
++     *
++     * @param count how many headers the caller expects, having already checked
++     *              the response reports that many
++     */
++    public static List<BlockHeader> parse(BlockHeaders chunk, int count) throws ProtocolException {
++        if(chunk.headers == null) {
++            return split(Utils.hexToBytes(chunk.hex), count);
++        }
++        if(chunk.headers.size() < count) {
++            throw new ProtocolException("Header list holds " + chunk.headers.size() + " of " + count + " headers");
++        }
++        List<BlockHeader> headers = new ArrayList<>(count);
++        for(int i = 0; i < count; i++) {
++            String header = chunk.headers.get(i);
++            if(header == null) {
++                throw new ProtocolException("Header list holds no header at index " + i);
++            }
++            headers.add(split(Utils.hexToBytes(header), 1).getFirst());
++        }
++        return headers;
 +    }
 +
 +    /**
@@ -285,7 +511,7 @@ index 0000000..a1e1603
 +                throw new ProtocolException("Header run ended early: wanted " + count + " headers, got " + i
 +                        + " before running out at offset " + offset + " of " + bytes.length);
 +            }
-+            int length = BlockHeaderV2.headerLength(bytes, offset);
++            int length = lengthFor(BlockHeaderV2.isV2(bytes, offset));
 +            if(offset + length > bytes.length) {
 +                throw new ProtocolException("Header " + i + " claims " + length + " bytes at offset " + offset
 +                        + " but only " + (bytes.length - offset) + " remain");
@@ -326,23 +552,21 @@ index 0000000..a1e1603
 +}
 diff --git a/src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java b/src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java
 new file mode 100644
-index 0000000..4046b5f
+index 00000000..00c3627a
 --- /dev/null
 +++ b/src/test/java/com/sparrowwallet/sparrow/net/Blake2bChainSyncHarness.java
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,90 @@
 +package com.sparrowwallet.sparrow.net;
 +
++import com.google.common.net.HostAndPort;
 +import com.sparrowwallet.drongo.Network;
 +import com.sparrowwallet.drongo.Utils;
 +import com.sparrowwallet.drongo.protocol.BlockHeader;
 +import com.sparrowwallet.drongo.protocol.HeaderChainState;
 +import com.sparrowwallet.drongo.protocol.Sha256Hash;
++import com.sparrowwallet.sparrow.io.Config;
 +
-+import java.io.BufferedReader;
-+import java.io.InputStreamReader;
-+import java.io.PrintWriter;
-+import java.net.Socket;
-+import java.nio.charset.StandardCharsets;
++import java.util.List;
 +
 +/**
 + * Drives Sparrow's own header path against a live Electrum server on a BLAKE2b
@@ -350,9 +574,17 @@ index 0000000..4046b5f
 + *
 + * <p>Not a unit test: it needs a server, so it is a main rather than something
 + * the build runs. It exists because the unit tests prove the pieces and this
-+ * proves the pieces fit: negotiation, the concatenated-blob walk, the variable
-+ * header length, the BLAKE2b block hash, and {@link HeaderChainState}'s linkage,
-+ * difficulty and proof-of-work rules, in the order Sparrow does them.
++ * proves the pieces fit: negotiation, the response checks, the walk, the
++ * variable header length, the BLAKE2b block hash, and {@link HeaderChainState}'s
++ * linkage, difficulty and proof-of-work rules, in the order Sparrow does them.
++ *
++ * <p>It goes through {@link SimpleElectrumServerRpc} over a real
++ * {@link TcpTransport} rather than speaking JSON-RPC itself. An earlier version
++ * did the latter, and that is precisely why it missed two defects: the checks in
++ * {@link ElectrumServerRpc} rejected a run of 164 byte headers before anything
++ * that could read them was reached, and the protocol 1.6 response form was not
++ * handled at all. A harness that reimplements the client tests the
++ * reimplementation.
 + *
 + * <pre>
 + *   java -cp ... Blake2bChainSyncHarness &lt;host&gt; &lt;port&gt; &lt;network&gt; &lt;anchorHeight&gt; &lt;count&gt;
@@ -366,38 +598,41 @@ index 0000000..4046b5f
 +        int anchorHeight = args.length > 3 ? Integer.parseInt(args[3]) : 0;
 +        int count = args.length > 4 ? Integer.parseInt(args[4]) : 30;
 +        Network.set(network);
++        Config.get().setUseProxy(false);
 +
-+        try(Socket socket = new Socket(host, port)) {
-+            PrintWriter out = new PrintWriter(new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
-+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
++        try(TcpTransport transport = new TcpTransport(HostAndPort.fromParts(host, port))) {
++            transport.connect();
++            Thread reader = new Thread(() -> {
++                try {
++                    transport.readInputLoop();
++                } catch(Exception e) {
++                    //Expected once the transport is closed
++                }
++            }, "Blake2bChainSyncHarnessRead");
++            reader.setDaemon(true);
++            reader.start();
 +
-+            String versions = String.join("\",\"", ElectrumServer.SUPPORTED_VERSIONS);
-+            out.println("{\"id\":0,\"method\":\"server.version\",\"params\":[\"Sparrow\",[\"" + versions + "\"]]}");
-+            String negotiated = in.readLine();
++            ElectrumServerRpc rpc = new SimpleElectrumServerRpc();
++
++            List<String> negotiated = rpc.getServerVersion(transport, "Sparrow", ElectrumServer.SUPPORTED_VERSIONS);
 +            System.out.println("negotiated : " + negotiated);
-+            if(negotiated == null || negotiated.contains("\"error\"")) {
-+                System.out.println("REFUSED: the server would not negotiate with " + java.util.Arrays.toString(ElectrumServer.SUPPORTED_VERSIONS));
-+                return;
-+            }
 +
 +            //The anchor. On regtest height 0 is genesis, which HeaderChainState accepts.
-+            out.println("{\"id\":1,\"method\":\"blockchain.block.header\",\"params\":[" + anchorHeight + "]}");
-+            String anchorHex = extract(in.readLine());
++            String anchorHex = rpc.getBlockHeaders(transport, null, java.util.Set.of(anchorHeight)).get(anchorHeight);
 +            BlockHeader anchor = new BlockHeader(Utils.hexToBytes(anchorHex));
 +            Sha256Hash anchorHash = anchor.getHash();
 +            System.out.println("anchor     : height " + anchorHeight + ", " + (anchorHex.length() / 2) + " bytes, hash " + anchorHash);
 +
-+            out.println("{\"id\":2,\"method\":\"blockchain.block.headers\",\"params\":[" + (anchorHeight + 1) + "," + count + "]}");
-+            String response = in.readLine();
-+            String blob = extract(response);
-+            int returned = extractCount(response);
-+            byte[] bytes = Utils.hexToBytes(blob);
-+            System.out.println("blob       : " + bytes.length + " bytes for " + returned + " headers"
-+                    + " (a fixed 80-byte stride would read " + (bytes.length / 80) + ")");
++            //Through the real checks: a run of 164 byte headers has to survive them before it can be read
++            BlockHeaders chunk = rpc.getBlockHeadersChunk(transport, anchorHeight + 1, count);
++            int bytes = chunk.hex != null ? chunk.hex.length() / 2 : chunk.headers.stream().mapToInt(h -> h.length() / 2).sum();
++            System.out.println("response   : " + (chunk.hex != null ? "concatenated" : "list (protocol 1.6 form)") + ", "
++                    + bytes + " bytes for " + chunk.count + " headers"
++                    + " (a fixed 80-byte stride would read " + (bytes / 80) + ")");
 +
-+            java.util.List<BlockHeader> headers = VariableHeaders.split(bytes, returned);
++            List<BlockHeader> headers = VariableHeaders.parse(chunk, chunk.count);
 +            long v1 = headers.stream().filter(h -> !h.isV2()).count();
-+            System.out.println("split      : " + headers.size() + " headers, " + v1 + " v1 and " + (headers.size() - v1) + " v2");
++            System.out.println("parsed     : " + headers.size() + " headers, " + v1 + " v1 and " + (headers.size() - v1) + " v2");
 +
 +            HeaderChainState state = new HeaderChainState(anchorHeight, anchorHash, anchor.getDifficultyTarget());
 +            int added = 0;
@@ -407,35 +642,265 @@ index 0000000..4046b5f
 +            }
 +            System.out.println("verified   : " + added + " headers accepted, tip height " + state.getHeight()
 +                    + " hash " + state.getHash());
-+            System.out.println("RESULT     : Sparrow's verification accepted a chain spanning the BLAKE2b activation.");
++            System.out.println("RESULT     : Sparrow's own path accepted a chain spanning the BLAKE2b activation.");
 +        }
 +    }
++}
+diff --git a/src/test/java/com/sparrowwallet/sparrow/net/Blake2bLiveHeadersHarness.java b/src/test/java/com/sparrowwallet/sparrow/net/Blake2bLiveHeadersHarness.java
+new file mode 100644
+index 00000000..d5eafef2
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/sparrow/net/Blake2bLiveHeadersHarness.java
+@@ -0,0 +1,97 @@
++package com.sparrowwallet.sparrow.net;
 +
-+    private static String extract(String json) {
-+        int i = json.indexOf("\"hex\"");
-+        int open = json.indexOf('"', json.indexOf(':', i));
-+        int close = json.indexOf('"', open + 1);
-+        if(i < 0) {
-+            //blockchain.block.header returns a bare string result
-+            int r = json.indexOf("\"result\"");
-+            open = json.indexOf('"', json.indexOf(':', r));
-+            close = json.indexOf('"', open + 1);
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.sparrowwallet.drongo.Network;
++import com.sparrowwallet.drongo.protocol.BlockHeader;
++import com.sparrowwallet.drongo.protocol.HeaderCheckpoints;
++import com.sparrowwallet.drongo.protocol.HeaderChainState;
++
++import java.io.File;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Runs a captured run of live BLAKE2b testnet4 headers through the path a
++ * running Sparrow uses, and reports what its own verification makes of them.
++ *
++ * <p>Not a unit test, because the headers come from a file that is fetched
++ * rather than committed: `spikes/blake2b-testnet4/fetch_fork_headers.py` in the
++ * electrs-pruned repo pulls them off a fork peer over p2p.
++ *
++ * <p>What this adds over the regtest harness is that nothing about the data is
++ * chosen. The regtest chain has a difficulty of one, timestamps a second apart,
++ * and an activation height picked to be convenient. These are the real
++ * difficulty targets, the real timestamps and the real activation at 149537, so
++ * {@link HeaderChainState}'s difficulty rule, proof-of-work check and
++ * median-time-past rule are being asked a question they could actually fail.
++ * The anchor is not chosen either: it is the last checkpoint Sparrow already
++ * ships for testnet4.
++ *
++ * <pre>
++ *   java -cp ... Blake2bLiveHeadersHarness &lt;fork-headers.json&gt;
++ * </pre>
++ */
++public class Blake2bLiveHeadersHarness {
++    public static void main(String[] args) throws Exception {
++        File file = new File(args[0]);
++        Network.set(Network.TESTNET4);
++
++        //Sparrow's own compiled-in pins, not an anchor chosen for the occasion. The last one is at
++        //149183, which is 354 blocks below the activation and on history the two chains share
++        HeaderCheckpoints checkpoints = HeaderCheckpoints.get(Network.TESTNET4);
++        int anchorHeight = checkpoints.getMaxHeight();
++        System.out.println("anchor     : Sparrow's last compiled-in testnet4 checkpoint, height "
++                + anchorHeight + ", hash " + checkpoints.getHash(anchorHeight));
++
++        JsonNode root = new ObjectMapper().readTree(file);
++        List<String> hexHeaders = new ArrayList<>();
++        for(JsonNode node : root.get("headers")) {
++            hexHeaders.add(node.asText());
 +        }
-+        return json.substring(open + 1, close);
++        System.out.println("source     : " + root.get("peer").asText() + " (" + root.get("user_agent").asText() + ")");
++        System.out.println("captured   : " + hexHeaders.size() + " headers following height " + anchorHeight);
++
++        //Presented the way a server below protocol 1.6 sends them, so the run has to be walked
++        BlockHeaders chunk = new BlockHeaders();
++        chunk.count = hexHeaders.size();
++        chunk.hex = String.join("", hexHeaders);
++        chunk.max = 2016;
++
++        //The real checks, which is where a run of 164 byte headers used to be refused
++        ElectrumServerRpc.checkBlockHeaders(chunk, anchorHeight + 1, chunk.count, null);
++        System.out.println("checked    : " + (chunk.hex.length() / 2) + " bytes accepted for " + chunk.count
++                + " headers (a fixed 80-byte stride would read " + (chunk.hex.length() / 160) + ")");
++
++        List<BlockHeader> headers = VariableHeaders.parse(chunk, chunk.count);
++        long v1 = headers.stream().filter(h -> !h.isV2()).count();
++        System.out.println("parsed     : " + headers.size() + " headers, " + v1 + " v1 and " + (headers.size() - v1) + " v2");
++
++        int activation = -1;
++        for(int i = 0; i < headers.size(); i++) {
++            if(headers.get(i).isV2()) {
++                activation = anchorHeight + 1 + i;
++                break;
++            }
++        }
++        System.out.println("activation : first v2 header at height " + activation);
++
++        HeaderChainState state = checkpoints.newChainState();
++        int added = 0;
++        try {
++            for(BlockHeader header : headers) {
++                state.add(header);      //linkage, difficulty, proof of work, median time past
++                added++;
++            }
++        } catch(Exception e) {
++            System.out.println("verified   : " + added + " headers accepted, then height "
++                    + (anchorHeight + 1 + added) + " was rejected: " + e.getMessage());
++            System.out.println("RESULT     : verification stopped inside the run.");
++            return;
++        }
++        System.out.println("verified   : " + added + " headers accepted, tip height " + state.getHeight()
++                + " hash " + state.getHash());
++        System.out.println("RESULT     : Sparrow's own verification accepted " + added
++                + " live headers across the real activation.");
++    }
++}
+diff --git a/src/test/java/com/sparrowwallet/sparrow/net/BlockHeadersResponseTest.java b/src/test/java/com/sparrowwallet/sparrow/net/BlockHeadersResponseTest.java
+new file mode 100644
+index 00000000..aa260ce7
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/sparrow/net/BlockHeadersResponseTest.java
+@@ -0,0 +1,144 @@
++package com.sparrowwallet.sparrow.net;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.github.arteam.simplejsonrpc.client.Transport;
++import com.sparrowwallet.drongo.Network;
++import com.sparrowwallet.drongo.protocol.BlockHeader;
++import com.sparrowwallet.drongo.protocol.VerificationException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * A blockchain.block.headers response carried through the path a running Sparrow uses: the JSON-RPC call, the deserialization into
++ * {@link BlockHeaders}, the checks in {@link ElectrumServerRpc}, and only then the split.
++ * <p>
++ * Deliberately not the split on its own. {@link ElectrumServerRpc#checkBlockHeaders} runs first and used to require a run of exactly 80 byte
++ * headers, so a chain carrying 164 byte ones was refused before anything that could read them was reached. A test that starts at the split
++ * cannot see that, and one that starts at the transport can.
++ * <p>
++ * The transport is a stub rather than a socket because nothing here is about the wire: the response is canned, and what is under test is
++ * everything Sparrow does with it.
++ */
++public class BlockHeadersResponseTest {
++    /**
++     * Real testnet4 headers spanning the BLAKE2b activation at height 149537, fetched from mempool.guide and frozen here. 149537 is the
++     * first v2 header and 149536 the last v1 one, so the pair is the transition itself rather than a constructed likeness of it, and 149537
++     * names 149536 as its parent, which is a check the headers are read correctly rather than merely accepted.
++     */
++    private static final String HEADER_149536 =
++            "00c07a2d48a589a1d9402520f5b20e264ce5159b58379f65b8656807d03ed10000000000d8ac297368de27e58b3c40c768bfbc64bd76e1abe63bea"
++                    + "50544d0e8cabd1f7e864098a6affff001d6c015cc3";
++    private static final String HEADER_149537 =
++            "000000a05119dc259b59eaefbccf48ecc15bfd50c499d9d65b500b361b1b60000000000063be46460c5e75edfe6e1fba731e3fc096396af99c299e"
++                    + "70625484ffc6f9184101fb896affff001d986cd88b510d792301fb896a00000000b14cf00d0100000000000000000000000f000000000000000000"
++                    + "00000000000000000000214802000000000000000000000000000000000000000000000000000000000000000000";
++
++    private static final String HASH_149536 = "0000000000601b1b360b505bd6d999c450fd5bc1ec48cfbcefea599b25dc1951";
++    private static final String HASH_149537 = "000000000068f60429c933dc0c8befbcc7edadb1cf8f8d0d7804c608fd736d82";
++
++    @AfterEach
++    public void tearDown() {
++        Network.set(null);
 +    }
 +
-+    private static int extractCount(String json) {
-+        int i = json.indexOf("\"count\"");
-+        int colon = json.indexOf(':', i);
-+        int end = colon + 1;
-+        while(end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == ' ')) {
-+            end++;
-+        }
-+        return Integer.parseInt(json.substring(colon + 1, end).trim());
++    @Test
++    public void aConcatenatedRunSpanningTheActivationReachesTheCaller() {
++        Network.set(Network.TESTNET4);
++        BlockHeaders chunk = fetch(149536, 2, "{\"count\":2,\"hex\":\"" + HEADER_149536 + HEADER_149537 + "\",\"max\":2016}");
++
++        assertActivationPair(VariableHeaders.parse(chunk, chunk.count));
++    }
++
++    /**
++     * Protocol 1.6 returns the run as a list rather than one string, and a client offering a range that spans 1.6 will be given it: Fulcrum
++     * 2.1.2 negotiates 1.6 against a max of 1.8 and answers in this form.
++     */
++    @Test
++    public void theProtocol16ListFormReachesTheCaller() {
++        Network.set(Network.TESTNET4);
++        BlockHeaders chunk = fetch(149536, 2,
++                "{\"count\":2,\"headers\":[\"" + HEADER_149536 + "\",\"" + HEADER_149537 + "\"],\"max\":2016}");
++
++        assertActivationPair(VariableHeaders.parse(chunk, chunk.count));
++    }
++
++    /** Both forms carry the same headers, so neither may be the only one that works. */
++    private static void assertActivationPair(List<BlockHeader> headers) {
++        assertEquals(2, headers.size());
++        assertFalse(headers.getFirst().isV2(), "149536 is the last v1 header");
++        assertTrue(headers.getLast().isV2(), "149537 is the first v2 header");
++        assertEquals(HASH_149536, headers.getFirst().getHash().toString());
++        assertEquals(HASH_149537, headers.getLast().getHash().toString());
++        assertEquals(headers.getFirst().getHash(), headers.getLast().getPrevBlockHash(), "149537 must name 149536 as its parent");
++    }
++
++    /**
++     * Regtest is where a node can be told to activate BLAKE2b, with -testactivationheight, and so is where the whole path is exercised
++     * without the live chain. It has to accept the same run testnet4 does.
++     */
++    @Test
++    public void regtestCarriesV2HeadersToo() {
++        Network.set(Network.REGTEST);
++        BlockHeaders chunk = fetch(149536, 2, "{\"count\":2,\"hex\":\"" + HEADER_149536 + HEADER_149537 + "\",\"max\":2016}");
++
++        assertActivationPair(VariableHeaders.parse(chunk, chunk.count));
++    }
++
++    /**
++     * The length rule is what stops a client reading a run as headers it is not. A response claiming more headers than its bytes hold is the
++     * shape a fixed stride produces, so it stays a refusal whatever the lengths involved.
++     */
++    @Test
++    public void aRunShorterThanItsReportedCountIsRefused() {
++        Network.set(Network.TESTNET4);
++        assertThrows(VerificationException.class,
++                () -> fetch(149536, 2, "{\"count\":2,\"hex\":\"" + HEADER_149536 + "\",\"max\":2016}"));
++        assertThrows(VerificationException.class,
++                () -> fetch(149536, 2, "{\"count\":2,\"headers\":[\"" + HEADER_149536 + "\"],\"max\":2016}"));
++    }
++
++    /** Trailing bytes on a header mean the server and the client disagree about the format, which is the thing worth failing on. */
++    @Test
++    public void aPaddedHeaderIsRefused() {
++        Network.set(Network.TESTNET4);
++        assertThrows(VerificationException.class,
++                () -> fetch(149536, 1, "{\"count\":1,\"hex\":\"" + HEADER_149536 + "0000\",\"max\":2016}"));
++    }
++
++    /**
++     * Only a chain that has activated BLAKE2b carries 164 byte headers, so a server offering one anywhere else is answering about a chain
++     * the client did not ask for. Mainnet stays exactly as strict as it was before variable lengths existed.
++     */
++    @Test
++    public void aV2HeaderIsRefusedOnANetworkThatCannotCarryOne() {
++        Network.set(Network.MAINNET);
++        assertThrows(VerificationException.class,
++                () -> fetch(149537, 1, "{\"count\":1,\"hex\":\"" + HEADER_149537 + "\",\"max\":2016}"));
++    }
++
++    /** Neither form, or both at once: in both cases there is no saying what the server meant. */
++    @Test
++    public void aResponseWithoutExactlyOneFormIsRefused() {
++        Network.set(Network.TESTNET4);
++        assertThrows(VerificationException.class, () -> fetch(149536, 1, "{\"count\":1,\"max\":2016}"));
++        assertThrows(VerificationException.class, () -> fetch(149536, 1,
++                "{\"count\":1,\"hex\":\"" + HEADER_149536 + "\",\"headers\":[\"" + HEADER_149536 + "\"],\"max\":2016}"));
++    }
++
++    private static BlockHeaders fetch(int startHeight, int count, String result) {
++        return new SimpleElectrumServerRpc().getBlockHeadersChunk(answering(result), startHeight, count);
++    }
++
++    /** A server that answers every request with the same result, echoing the id the client chose. */
++    private static Transport answering(String result) {
++        ObjectMapper mapper = new ObjectMapper();
++        return request -> "{\"jsonrpc\":\"2.0\",\"id\":" + mapper.readTree(request).get("id") + ",\"result\":" + result + "}";
 +    }
 +}
 diff --git a/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java b/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java
-index ed4ab5d..3e3ddc8 100644
+index ed4ab5dd..c83b063a 100644
 --- a/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java
 +++ b/src/test/java/com/sparrowwallet/sparrow/net/HeaderStoreTest.java
 @@ -82,7 +82,7 @@ public class HeaderStoreTest {
@@ -516,6 +981,17 @@ index ed4ab5d..3e3ddc8 100644
      }
  
      @Test
+@@ -332,7 +332,9 @@ public class HeaderStoreTest {
+     private static void writeStoreFile(String name, List<BlockHeader> headers) throws IOException {
+         try(RandomAccessFile randomAccessFile = new RandomAccessFile(new File(Storage.getHeadersDir(), name), "rw")) {
+             for(BlockHeader header : headers) {
+-                randomAccessFile.write(header.bitcoinSerialize());
++                //Records, not serializations: the store indexes by height times a fixed stride, which on a network that can carry
++                //164 byte headers is wider than an 80 byte one. Writing the serialization would build a file the store cannot read
++                randomAccessFile.write(VariableHeaders.toRecord(header));
+             }
+         }
+     }
 -- 
 2.43.0
 
