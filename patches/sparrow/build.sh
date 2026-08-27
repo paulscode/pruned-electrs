@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a Sparrow that can follow the BLAKE2b chain, on Linux.
 #
-#   ./build.sh [workdir]        default: /tmp/sparrow-blake2b
+#   ./build.sh [workdir]        default: a sparrow-blake2b/ beside the repo
 #
 # Clones Sparrow at the revision these patches were made against, checks out its
 # submodules at their pins, applies the two patches, and builds. Leaves a tree
@@ -20,13 +20,22 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PATCHES="$PWD"
-WORK="${1:-/tmp/sparrow-blake2b}"
+# A sibling of the repository, not /tmp. The tree is ~1.4 GB and takes a clone
+# plus a full build to recreate, and /tmp would lose it to a reboot with no
+# warning partway through a test session. A sibling also lands it on whatever
+# volume the checkout is on, which is the one with room for it by construction.
+WORK="${1:-$(cd "$PATCHES/../.." && pwd)/../sparrow-blake2b}"
+WORK="$(mkdir -p "$(dirname "$WORK")" && cd "$(dirname "$WORK")" && pwd)/$(basename "$WORK")"
 
 # Sparrow needs Java 25. Its releases are built with Temurin 25.0.2+10; anything
 # 25 or newer works. The build fails on 21 or below, because drongo uses unnamed
 # lambda parameters, which are a preview feature there and final in 22.
+#
+# Distributions are still shipping 21 as their newest, so an unpacked Temurin in
+# $HOME/bin is the usual way to have one. /tmp is searched last and deliberately:
+# it is where an unpack lands by accident, and it does not survive a reboot.
 if [ -z "${JAVA_HOME:-}" ]; then
-    for candidate in /usr/lib/jvm/java-25* /tmp/jdk-25*; do
+    for candidate in "$HOME"/bin/jdk-25* "$HOME"/jdk-25* /usr/lib/jvm/java-25* /opt/jdk-25* /tmp/jdk-25*; do
         [ -x "$candidate/bin/javac" ] && { JAVA_HOME="$candidate"; break; }
     done
 fi
@@ -41,7 +50,7 @@ export JAVA_HOME
 # The revision the patches were made against. Pinned, not `main`: these touch
 # header parsing and the on-disk store, and applying them to a moved tree with
 # --3way would be a merge nobody reviewed.
-SPARROW_REV=74060d14723b3805e72db8e137a1f3c326aeda4e
+SPARROW_REV=624f999ec5b8681b79ecd0f025cfe0999a496b4f
 
 if [ ! -d "$WORK" ]; then
     echo "cloning Sparrow into $WORK"
@@ -52,11 +61,26 @@ git fetch -q --all
 git checkout -q "$SPARROW_REV"
 git submodule update --init --recursive --depth 1 -q
 
+# Idempotent, because the tree persists between runs now that it is not in /tmp.
+# A patch that reverse-applies cleanly is already in the tree, and re-applying it
+# would fail and take the script down with it. Anything else is left to fail
+# loudly: a tree that is neither clean nor patched is one to look at, not one to
+# paper over.
+apply_patch() {
+    local repo="$1" patch="$2" name
+    name="$(basename "$patch")"
+    if git -C "$repo" apply --reverse --check "$patch" 2>/dev/null; then
+        echo "  $name already applied"
+    else
+        git -C "$repo" apply --check "$patch"
+        git -C "$repo" apply "$patch"
+        echo "  $name applied"
+    fi
+}
+
 echo "applying patches"
-git -C drongo apply --check "$PATCHES"/0001-*.patch
-git -C drongo apply "$PATCHES"/0001-*.patch
-git apply --check "$PATCHES"/0002-*.patch
-git apply "$PATCHES"/0002-*.patch
+apply_patch drongo "$PATCHES"/0001-*.patch
+apply_patch . "$PATCHES"/0002-*.patch
 
 echo "building"
 ./gradlew build -x test --console=plain
