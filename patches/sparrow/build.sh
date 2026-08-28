@@ -50,7 +50,12 @@ export JAVA_HOME
 # The revision the patches were made against. Pinned, not `main`: these touch
 # header parsing and the on-disk store, and applying them to a moved tree with
 # --3way would be a merge nobody reviewed.
-SPARROW_REV=624f999ec5b8681b79ecd0f025cfe0999a496b4f
+#
+# Tag 2.5.4, rather than a commit off master, so the build corresponds to a
+# Sparrow release someone could otherwise have downloaded. Both patches were
+# re-checked against it and its drongo pin (080cf3f) with `git apply --check`
+# before the pin moved; neither needed a change.
+SPARROW_REV=8871f4f1af528a4673fee6129373c884e3267860  # tag 2.5.4
 
 if [ ! -d "$WORK" ]; then
     echo "cloning Sparrow into $WORK"
@@ -58,24 +63,43 @@ if [ ! -d "$WORK" ]; then
 fi
 cd "$WORK"
 git fetch -q --all
+
 git checkout -q "$SPARROW_REV"
 git submodule update --init --recursive --depth 1 -q
 
 # Idempotent, because the tree persists between runs now that it is not in /tmp.
-# A patch that reverse-applies cleanly is already in the tree, and re-applying it
-# would fail and take the script down with it. Anything else is left to fail
-# loudly: a tree that is neither clean nor patched is one to look at, not one to
-# paper over.
+# A patch that reverse-applies cleanly is already in the tree and is left alone;
+# re-applying it would fail and take the script down with it.
+#
+# Otherwise the patch's own footprint is reset before applying, and that is not
+# belt-and-braces. `git checkout` reverts tracked edits but leaves untracked files
+# alone, so a tree that was patched and then reset by hand keeps BlockHeaderV2.java
+# while BlockHeader.java has gone back to upstream. In that half-applied state
+# `--reverse --check` fails because the created files no longer match, and a plain
+# apply fails with "already exists in working directory". Resetting exactly the
+# files this patch touches, read out of the patch so the list cannot drift, turns
+# both of those into a clean apply.
 apply_patch() {
     local repo="$1" patch="$2" name
     name="$(basename "$patch")"
     if git -C "$repo" apply --reverse --check "$patch" 2>/dev/null; then
         echo "  $name already applied"
-    else
-        git -C "$repo" apply --check "$patch"
-        git -C "$repo" apply "$patch"
-        echo "  $name applied"
+        return
     fi
+
+    # Files the patch creates: delete them. Files it only edits: revert them.
+    awk '/^diff --git/{f=$4} /^new file mode/{print substr(f,3)}' "$patch" \
+        | while read -r created; do rm -f "$repo/$created"; done
+    awk '/^diff --git/{f=substr($4,3); new=0}
+         /^new file mode/{new=1}
+         /^--- /{if (!new && f != "") {print f; f=""}}' "$patch" \
+        | while read -r edited; do
+              git -C "$repo" checkout -- "$edited" 2>/dev/null || true
+          done
+
+    git -C "$repo" apply --check "$patch"
+    git -C "$repo" apply "$patch"
+    echo "  $name applied"
 }
 
 echo "applying patches"

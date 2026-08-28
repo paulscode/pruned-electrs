@@ -244,15 +244,20 @@ not a replay of `HeaderChainState.add()`; the regtest run above is still what ex
 the linkage, difficulty and median-time-past rules directly.
 
 **Which revision.** The build that ran this was Sparrow `74060d14` plus these two patches.
-That was neither what `build.sh` pinned at the time (`d8ea4264`) nor what it pins now
+That was neither what `build.sh` pinned at the time (`d8ea4264`) nor what it pinned next
 (`624f999e`): the tree had been built before the pin moved, so for a while the pin named a
-revision nobody had run. That is closed. The tree is rebuilt at `624f999e` with drongo at
-its matching pin `0d8aaac`, both patches apply, the build succeeds, and the three header
-suites pass there: `BlockHeaderV2Test` 4, `HeaderStoreTest` 12, `BlockHeadersResponseTest`
-7, read from the XML reports rather than the console.
+revision nobody had run. That is closed, and has been kept closed since.
+
+`build.sh` now pins **tag `2.5.4`** (`8871f4f1`), a Sparrow release rather than a commit off
+master, with drongo at its matching pin `080cf3f`. Both patches were checked against it with
+`git apply --check` before the pin moved, then the tree was rebuilt there and the three header
+suites re-run: `BlockHeaderV2Test` 4, `HeaderStoreTest` 12, `BlockHeadersResponseTest` 7, all
+passing, read from the XML reports rather than the console. Same counts as at `624f999e`.
 
 Worth keeping straight: the live evidence above was gathered at `74060d14`, and what is
-verified at `624f999e` is that the patches apply, compile and pass their tests. The five
-Sparrow commits and two drongo commits between the two touch none of the thirteen files
-these patches change, which is why the gap is small, but it is not zero and a re-run
-against the live chain is what would make it zero.
+verified at `2.5.4` is that the patches apply, compile and pass their tests. The commits
+between the two touch none of the thirteen files these patches change, which is why the gap is
+small, but it is not zero and a re-run against the live chain is what would make it zero. That
+re-run is also owed for a second reason now: the chain it was gathered on no longer exists, the
+public BLAKE2b testnet4 having restarted on a later Knots release candidate that moved the fork
+from height 149537 to 150027.
