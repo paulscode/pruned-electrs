@@ -39,14 +39,24 @@ MAGIC = bytes.fromhex("1c163f28")
 DEFAULT_PORT = 48333
 PROTOCOL_VERSION = 70016
 
-# Height 149537 is the first BLAKE2b block, so 149536 is the last block both
-# chains have. The locator has to be the *common* one: a Core node has never
-# heard of 149537 and would answer from genesis instead of from the fork point.
-# Derived from block 149537's own prev_blockhash field, not looked up.
-FORK_HEIGHT = 149537
-LAST_COMMON_HEIGHT = 149536
-LAST_COMMON_HASH = "0000000000601b1b360b505bd6d999c450fd5bc1ec48cfbcefea599b25dc1951"
-FORK_BLOCK_HASH = "000000000068f60429c933dc0c8befbcc7edadb1cf8f8d0d7804c608fd736d82"
+# The first BLAKE2b block, and the last block both chains have. The locator has
+# to be the *common* one: a Core node has never heard of the fork block and would
+# answer from genesis instead of from the fork point. Derived from the fork
+# block's own prev_blockhash field, not looked up.
+#
+# These move. The activation height is re-cut with every Knots release candidate
+# and the chain restarts under it, so a stale pair here does not fail loudly, it
+# silently classifies every peer as non-fork. rc2 forked at 149537
+# (000000000068f604...); rc3, below, forks at 150027. To refresh, find the height
+# where mempool.guide's header goes from 80 bytes to 164:
+#
+#   curl -s .../api/block-height/N | xargs -I{} curl -s .../api/block/{}/header | wc -c
+#
+# then take LAST_COMMON_HASH from the fork block's prev_blockhash, as here.
+FORK_HEIGHT = 150027
+LAST_COMMON_HEIGHT = 150026
+LAST_COMMON_HASH = "00000000000000004f7721bb0999cf84ce7e52db90eb1e0d55b42ab734c9a503"
+FORK_BLOCK_HASH = "000000000000007a178eb03e6619f0420d7d38e278e6bb5ee16f15ac5b32cee6"
 
 VERSION_HEADER_V2_FLAG = 0x8000_0000
 

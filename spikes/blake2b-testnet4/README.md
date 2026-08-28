@@ -3,6 +3,22 @@
 A node running the BLAKE2b fork cannot find the fork's chain by itself. This is
 the tool that finds it peers, and the record of what it found on 2026-08-24.
 
+> **The chain below is the rc2 one, and it no longer exists.** The public BLAKE2b
+> testnet4 restarted on Knots release candidate rc3, which moved activation from
+> 149537 to 150027. Every height and hash in this document belongs to the earlier
+> chain and is kept as the record of that scan. `find_fork_peers.py` has been
+> retargeted to the live chain (`FORK_HEIGHT = 150027`, last common block 150026,
+> `00000000000000004f7721bb…`, taken from the fork block's own `prev_blockhash`),
+> and the constants carry a note on refreshing them, because the activation height
+> is re-cut with every release candidate.
+>
+> **Re-probed 2026-08-28 against the rc3 chain**, using the eight peers the
+> `knots-blake2b` package ships. Seven answered, all seven on the BLAKE2b chain,
+> all reporting `/Satoshi:29.4.1/Knots:20260508rc3/` or a variant, each serving
+> 195 headers after 150026 whose first is 164 bytes. `172.117.233.59:48333` did not
+> answer. So the shipped peer list survived the restart and needs no change, and
+> the peers' own user agents are independent confirmation that rc3 is what is live.
+
 ## Why this is needed at all
 
 The fork shares testnet4's genesis block, magic bytes (`1c163f28`) and default
