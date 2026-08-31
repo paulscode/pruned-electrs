@@ -1,7 +1,7 @@
 From bef112997ec9caa40ce132175a780743b7147845 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 24 Aug 2026 18:44:36 -0500
-Subject: [PATCH 3/7] headerv2: add the BLAKE2b 164-byte header type and its
+Subject: [PATCH 3/8] headerv2: add the BLAKE2b 164-byte header type and its
  hash
 
 Bitcoin Knots PR #359 introduces a second block-header format. It is 164

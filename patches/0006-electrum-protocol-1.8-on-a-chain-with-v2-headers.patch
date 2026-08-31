@@ -1,7 +1,7 @@
 From 787aa35b9fb57e8a1f054da85e8b548a9ed8cb77 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Tue, 25 Aug 2026 06:02:19 -0500
-Subject: [PATCH 6/7] electrum: protocol 1.8 on a chain with v2 headers
+Subject: [PATCH 6/8] electrum: protocol 1.8 on a chain with v2 headers
 
 Implements the server half of docs/electrum-header-v2.md, kept in one
 place so replacing it with whatever upstream settles on means deleting a

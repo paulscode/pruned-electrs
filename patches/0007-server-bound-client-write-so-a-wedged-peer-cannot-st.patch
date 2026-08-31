@@ -1,7 +1,7 @@
 From ec71988ee19e9b73132dd7a6f8aaadc9936b6ef7 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 31 Aug 2026 09:37:48 -0500
-Subject: [PATCH 7/7] server: bound client write so a wedged peer cannot stall
+Subject: [PATCH 7/8] server: bound client write so a wedged peer cannot stall
  the server
 
 Carried into this tree from the package's patch set, which had it while

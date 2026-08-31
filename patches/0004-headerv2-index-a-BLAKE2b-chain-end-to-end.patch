@@ -1,7 +1,7 @@
 From af33419201a70f915a49559361351e89999e6414 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 24 Aug 2026 19:54:16 -0500
-Subject: [PATCH 4/7] headerv2: index a BLAKE2b chain end to end
+Subject: [PATCH 4/8] headerv2: index a BLAKE2b chain end to end
 
 Wires HeaderV2 and AnyHeader through the parts of electrs that touch a
 header: chain, types, db, index, p2p, status, tracker, electrum. Before

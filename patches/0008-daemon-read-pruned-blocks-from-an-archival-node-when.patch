@@ -1,0 +1,350 @@
+From e9fc4bf162e17ef8bedfea422f4e1a3f83ec35d4 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Mon, 31 Aug 2026 12:18:16 -0500
+Subject: [PATCH 8/8] daemon: read pruned blocks from an archival node when one
+ is available
+
+A fork's two chains share every block below the split, so an operator
+running a pruned node of one chain and a full node of the other already
+holds locally almost everything the pruned node has discarded. Those blocks
+were being pulled off the network one at a time through btc-rpc-proxy at
+~0.24s each, roughly 950,000 of them on mainnet, while sitting on the same
+disk.
+
+`helper_rpc_addr` and `helper_cookie_file` name that node. It is consulted
+only for blocks below the prune height, and only ever as a first try: any
+failure falls back to the existing path, so the worst case is the behaviour
+every install has today. Both options must be set or neither; half a
+configuration is dropped with a reason rather than failing per block.
+
+Checked once at startup rather than per block, and rejected with a reason
+if it cannot help: a pruned helper holds none of the missing history, and
+one whose tip is below this node's prune height has not reached the blocks
+being asked for and would look like a boundary at every height.
+
+The upper bound is learned, not configured. The helper follows the other
+chain, so it has the shared history and nothing above it, and the split
+height is chain-specific and moves with the fork. Asking by hash makes the
+boundary discoverable: the first hash the helper reports as unknown fixes a
+ceiling and nothing above it is asked again. Only `Block not found` counts;
+a timeout or a restart must not fix the ceiling, or a moment's
+unavailability would disable the helper for the rest of the build.
+
+Returned bytes are checked against the hash requested. Asking by hash is
+already self-limiting, since a block from the other side of the split has a
+hash this node has never seen, but nothing else in the pipeline verifies
+what a block source returns and this is the one source that is a different
+node on a different chain. One header parse removes the question.
+
+Verified on the regtest harness, whose topology is exactly this: archival A
+behind pruned B. With the helper configured, peer fetches at the proxy went
+from 250 to 0 and all seven Electrum query checks still passed. A helper
+that is pruned, unreachable, or half-configured is refused with a reason
+and indexing completes unchanged.
+---
+ internal/config_specification.toml |  10 ++
+ src/config.rs                      |  22 ++++
+ src/daemon.rs                      | 164 +++++++++++++++++++++++++++--
+ 3 files changed, 190 insertions(+), 6 deletions(-)
+
+diff --git a/internal/config_specification.toml b/internal/config_specification.toml
+index f4ae65e..4418723 100644
+--- a/internal/config_specification.toml
++++ b/internal/config_specification.toml
+@@ -81,6 +81,16 @@ name = "daemon_p2p_addr"
+ type = "crate::config::ResolvAddr"
+ doc = "Bitcoin daemon p2p 'addr:port' to connect (default: 127.0.0.1:8333 for mainnet, 127.0.0.1:18333 for testnet, 127.0.0.1:18444 for regtest and 127.0.0.1:38333 for signet)"
+ 
++[[param]]
++name = "helper_rpc_addr"
++type = "crate::config::ResolvAddr"
++doc = "Optional archival node to read pruned blocks from, as 'addr:port'. Both chains of a fork share every block below the split, so a second full node on this machine already holds most of what a pruned node has discarded, and reading them over a local RPC is far cheaper than fetching them from the network. Only consulted for blocks the pruned node no longer has; a block this node cannot supply falls back to the usual path. Ignored unless helper_cookie_file is also set."
++
++[[param]]
++name = "helper_cookie_file"
++type = "std::path::PathBuf"
++doc = "Cookie file authenticating to helper_rpc_addr. Ignored unless helper_rpc_addr is also set."
++
+ [[param]]
+ name = "monitoring_addr"
+ type = "crate::config::ResolvAddr"
+diff --git a/src/config.rs b/src/config.rs
+index b844dda..8942640 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -132,6 +132,11 @@ pub struct Config {
+     pub daemon_auth: SensitiveAuth,
+     pub daemon_rpc_addr: SocketAddr,
+     pub daemon_p2p_addr: SocketAddr,
++    /// An archival node to read pruned blocks from, and the cookie authenticating to it.
++    ///
++    /// `Some` only when both the address and the cookie were given: half a configuration is not a
++    /// usable source, and treating it as one would fail on every block instead of saying so once.
++    pub helper: Option<(SocketAddr, PathBuf)>,
+     pub electrum_rpc_addr: SocketAddr,
+     pub monitoring_addr: SocketAddr,
+     pub wait_duration: Duration,
+@@ -252,6 +257,22 @@ impl Config {
+             (DEFAULT_SERVER_ADDRESS, default_daemon_rpc_port).into(),
+             ResolvAddr::resolve_or_exit,
+         );
++        // Both or neither. An address without a cookie cannot authenticate and a cookie without an
++        // address has nowhere to go, so a half-set pair is dropped here with a warning rather than
++        // becoming a source that fails on every block.
++        let helper = match (config.helper_rpc_addr, config.helper_cookie_file) {
++            (Some(addr), Some(cookie)) => Some((addr.resolve_or_exit(), cookie)),
++            (None, None) => None,
++            (addr, _) => {
++                eprintln!(
++                    "ignoring the pruned-block helper: {} was set without {}",
++                    if addr.is_some() { "helper_rpc_addr" } else { "helper_cookie_file" },
++                    if addr.is_some() { "helper_cookie_file" } else { "helper_rpc_addr" },
++                );
++                None
++            }
++        };
++
+         let daemon_p2p_addr: SocketAddr = config.daemon_p2p_addr.map_or(
+             (DEFAULT_SERVER_ADDRESS, default_daemon_p2p_port).into(),
+             ResolvAddr::resolve_or_exit,
+@@ -345,6 +366,7 @@ impl Config {
+             daemon_auth,
+             daemon_rpc_addr,
+             daemon_p2p_addr,
++            helper,
+             electrum_rpc_addr,
+             monitoring_addr,
+             wait_duration: Duration::from_secs(config.wait_duration_secs),
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 192c0e2..f3d6632 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -11,12 +11,15 @@ use serde_json::{json, value::RawValue, Value};
+ 
+ use std::fs::File;
+ use std::io::Read;
++use std::net::SocketAddr;
+ use std::path::Path;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::time::{Duration, Instant};
+ 
+ use crate::{
+     chain::{Chain, NewHeader},
+     config::Config,
++    headerv2::AnyHeader,
+     metrics::Metrics,
+     p2p::Connection,
+     signals::ExitFlag,
+@@ -80,6 +83,38 @@ fn read_cookie(path: &Path) -> Result<(String, String)> {
+     Ok((parts[0].to_owned(), parts[1].to_owned()))
+ }
+ 
++/// `getblock <hash> 0` against a given client, so the helper can be asked with the same call.
++fn get_block_raw_with(client: &Client, hash: BlockHash) -> Result<SerBlock> {
++    let hex: String = client
++        .call("getblock", &[json!(hash), json!(0)])
++        .context("getblock failed")?;
++    Vec::from_hex(&hex).context("bitcoind returned a non-hex block")
++}
++
++/// Is this the RPC error bitcoind gives for a block it has never heard of?
++///
++/// Distinguished from every other failure because it is the only one that also means "and never
++/// will be": it marks where the helper's chain and this one diverged. Matched on the message rather
++/// than the code because the error arrives here already wrapped by `anyhow`.
++fn is_block_not_found(err: &anyhow::Error) -> bool {
++    format!("{:#}", err).contains("Block not found")
++}
++
++/// Connect to the archival helper, which is a different node with a different cookie.
++///
++/// Deliberately not `rpc_connect`: that one reads the address and auth of the node being indexed,
++/// and the helper is by definition somewhere else. Only the timeout is shared.
++fn connect_helper(addr: SocketAddr, cookie: &Path, config: &Config) -> Result<Client> {
++    let (user, pass) = read_cookie(cookie)?;
++    let builder = jsonrpc::simple_http::SimpleHttpTransport::builder()
++        .url(&format!("http://{}", addr))?
++        .timeout(config.jsonrpc_timeout)
++        .auth(user, Some(pass));
++    Ok(Client::from_jsonrpc(jsonrpc::Client::with_transport(
++        builder.build(),
++    )))
++}
++
+ fn rpc_connect(config: &Config) -> Result<Client> {
+     let rpc_url = format!("http://{}", config.daemon_rpc_addr);
+     // Allow RPC calls to take longer before timing out.
+@@ -103,6 +138,22 @@ fn rpc_connect(config: &Config) -> Result<Client> {
+ pub struct Daemon {
+     p2p: Mutex<Connection>,
+     rpc: Client,
++    /// An archival node to read pruned blocks from before falling back to the usual source.
++    ///
++    /// A fork's two chains share every block below the split, so a second full node on the same
++    /// machine already holds most of what this pruned node has discarded, and a local read beats
++    /// pulling the same block off the network. Absent unless configured and verified archival.
++    helper: Option<Client>,
++    /// Heights at or above this are not offered to the helper.
++    ///
++    /// Learned rather than configured. The helper is on the *other* side of a chain split, so it
++    /// has the shared history and nothing above it, and where that ends is not something this
++    /// process can be told reliably: the split height is chain-specific and changes with the fork.
++    /// Asking by hash makes the boundary discoverable instead. The first hash the helper reports as
++    /// unknown fixes the ceiling, and nothing above it is asked again.
++    ///
++    /// Starts at `usize::MAX` so the boundary is found once rather than assumed.
++    helper_ceiling: AtomicUsize,
+     /// Whether bitcoind is pruning. Fixed for the life of the connection: a
+     /// node cannot start pruning without a restart, and a restart drops the p2p
+     /// connection, which takes electrs down with it.
+@@ -185,6 +236,43 @@ impl Daemon {
+         }
+         let pruned = info.pruned;
+ 
++        // Connect the helper and check it is worth using, once, here rather than per block.
++        //
++        // Two conditions, and both matter. Archival, because a second pruned node has discarded the
++        // same history and would answer nothing. And a tip past this node's prune height, because a
++        // node still syncing has not reached the blocks being asked for and would look like a
++        // boundary at every height, fixing the ceiling at the bottom and disabling itself.
++        //
++        // A helper that fails either test is dropped with a reason rather than retried: it is an
++        // optimisation, and running without it is the behaviour every other install has.
++        let helper = match (pruned, &config.helper) {
++            (false, _) | (_, None) => None,
++            (true, Some((addr, cookie))) => match connect_helper(*addr, cookie, config) {
++                Ok(client) => match client.get_blockchain_info() {
++                    Ok(h) if h.pruned => {
++                        warn!("ignoring the pruned-block helper at {}: it is pruned too, so it holds none of the blocks this node is missing", addr);
++                        None
++                    }
++                    Ok(h) if (h.blocks as usize) < info.prune_height.unwrap_or(0) as usize => {
++                        warn!("ignoring the pruned-block helper at {}: it is at height {}, below this node's prune height {}, so it has not reached the blocks being asked for", addr, h.blocks, info.prune_height.unwrap_or(0));
++                        None
++                    }
++                    Ok(h) => {
++                        info!("reading pruned blocks from the archival helper at {} (height {}) before falling back", addr, h.blocks);
++                        Some(client)
++                    }
++                    Err(e) => {
++                        warn!("ignoring the pruned-block helper at {}: {}", addr, e);
++                        None
++                    }
++                },
++                Err(e) => {
++                    warn!("ignoring the pruned-block helper at {}: {:#}", addr, e);
++                    None
++                }
++            },
++        };
++
+         let p2p = Mutex::new(Connection::connect(
+             config.daemon_p2p_addr,
+             metrics,
+@@ -194,6 +282,8 @@ impl Daemon {
+             p2p,
+             rpc,
+             pruned,
++            helper,
++            helper_ceiling: AtomicUsize::new(usize::MAX),
+             exit_flag: exit_flag.clone(),
+         })
+     }
+@@ -466,7 +556,13 @@ impl Daemon {
+             if local {
+                 self.p2p.lock().for_blocks(run.iter().copied(), &mut func)?;
+             } else {
+-                for &hash in run {
++                for (offset, &hash) in run.iter().enumerate() {
++                    // Try the archival helper first. It holds the shared history below the split and
++                    // answers from local disk; anything it does not have falls through unchanged.
++                    if let Some(block) = self.block_from_helper(hash, heights[start + offset]) {
++                        func(hash, block);
++                        continue;
++                    }
+                     let block = self
+                         .retry_rpc(&format!("fetching pruned block {}", hash), budget, || {
+                             self.get_block_raw_rpc(hash)
+@@ -486,6 +582,66 @@ impl Daemon {
+         Ok(())
+     }
+ 
++    /// A pruned block read from the archival helper, or `None` to use the usual source.
++    ///
++    /// Never an error: the helper is an optimisation, so every way it can fail resolves to falling
++    /// back rather than to stopping. The caller cannot tell the difference except in speed.
++    ///
++    /// The returned bytes are checked against the hash that was asked for. Fetching by hash is
++    /// already self-limiting — a block on the other side of the split has a hash this node has
++    /// never seen, so it cannot be served by mistake — but nothing else in the pipeline verifies
++    /// what a block source returns, and this is the one source that is a different node following a
++    /// different chain. Checking here costs one header parse and removes the whole question.
++    fn block_from_helper(&self, hash: BlockHash, height: usize) -> Option<SerBlock> {
++        let helper = self.helper.as_ref()?;
++        if height >= self.helper_ceiling.load(Ordering::Relaxed) {
++            return None;
++        }
++
++        match get_block_raw_with(helper, hash) {
++            Ok(block) => match AnyHeader::parse(&block) {
++                // The expected case: shared history, byte-identical on both chains.
++                Ok(header) if header.block_hash() == hash => Some(block),
++                // Bytes that are not the block that was asked for. Not a boundary and not
++                // transient, so the helper is wrong about something and is dropped for this block
++                // loudly rather than quietly.
++                Ok(header) => {
++                    warn!(
++                        "the archival helper returned {} for block {}; using the usual source instead",
++                        header.block_hash(),
++                        hash
++                    );
++                    None
++                }
++                Err(e) => {
++                    warn!("the archival helper returned an unparseable block for {}: {:#}", hash, e);
++                    None
++                }
++            },
++            Err(e) => {
++                // `Block not found` is the boundary: the helper's chain diverged below this height,
++                // so nothing above it will be there either. Recording it turns a per-block failure
++                // into one failure for the rest of the run.
++                //
++                // Every other error is transient by assumption — the helper restarting, a timeout —
++                // and must not fix the ceiling, or a moment's unavailability would disable the
++                // helper for the whole index build.
++                if is_block_not_found(&e) {
++                    let prev = self.helper_ceiling.swap(height, Ordering::Relaxed);
++                    if prev == usize::MAX {
++                        info!(
++                            "the archival helper does not have block {} at height {}; using it only below that height from now on",
++                            hash, height
++                        );
++                    }
++                } else {
++                    debug!("the archival helper failed for block {}: {:#}", hash, e);
++                }
++                None
++            }
++        }
++    }
++
+     /// Lowest height bitcoind still stores block data for. Re-read per batch
+     /// rather than cached: it advances as bitcoind prunes, and reading a stale
+     /// value low would route a since-pruned block to p2p and hang.
+@@ -519,11 +675,7 @@ impl Daemon {
+     /// `getblock <hash> 0` is the verbosity btc-rpc-proxy intercepts and will
+     /// satisfy from peers when bitcoind has pruned the block.
+     fn get_block_raw_rpc(&self, hash: BlockHash) -> Result<SerBlock> {
+-        let hex: String = self
+-            .rpc
+-            .call("getblock", &[json!(hash), json!(0)])
+-            .context("getblock failed")?;
+-        Vec::from_hex(&hex).context("bitcoind returned a non-hex block")
++        get_block_raw_with(&self.rpc, hash)
+     }
+ 
+     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
+-- 
+2.43.0
+

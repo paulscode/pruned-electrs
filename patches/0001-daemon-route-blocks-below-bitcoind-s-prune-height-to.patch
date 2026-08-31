@@ -1,7 +1,7 @@
 From 5676a66d6a2c60f1ed1a7323902e67d955dd74bb Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Sat, 22 Aug 2026 19:24:32 -0500
-Subject: [PATCH 1/7] daemon: route blocks below bitcoind's prune height to RPC
+Subject: [PATCH 1/8] daemon: route blocks below bitcoind's prune height to RPC
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

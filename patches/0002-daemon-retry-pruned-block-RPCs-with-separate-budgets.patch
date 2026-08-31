@@ -1,7 +1,7 @@
 From b7cb051c8ae12ad39cae3fe90c58fe83be0784ee Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 24 Aug 2026 07:53:04 -0500
-Subject: [PATCH 2/7] daemon: retry pruned-block RPCs, with separate budgets
+Subject: [PATCH 2/8] daemon: retry pruned-block RPCs, with separate budgets
  per caller
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

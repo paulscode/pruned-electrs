@@ -1,7 +1,7 @@
 From b124954dace03523e65be927805cc13d0c1217a4 Mon Sep 17 00:00:00 2001
 From: Paul Lamb <paul@paulscode.com>
 Date: Mon, 24 Aug 2026 20:08:28 -0500
-Subject: [PATCH 5/7] headerv2: record that rust-bitcoin cannot decode a v2
+Subject: [PATCH 5/8] headerv2: record that rust-bitcoin cannot decode a v2
  block
 
 A test rather than a change. It pins the assumption the whole module
